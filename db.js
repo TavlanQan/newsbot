@@ -1,70 +1,60 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-// 📊 ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ SQLite
-// База создается автоматически в файле news_bot.db
 const dbPath = path.join(__dirname, 'news_bot.db');
 const db = new sqlite3.Database(dbPath);
 
-// 🏗️ ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ - создаем таблицы если их нет
 function initializeDB() {
   return new Promise((resolve, reject) => {
-    // Таблица для ключевых слов поиска
     db.run(`CREATE TABLE IF NOT EXISTS keywords (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      keyword TEXT UNIQUE NOT NULL,      -- Само ключевое слово
+      keyword TEXT UNIQUE NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Таблица для отправленных новостей (чтобы не дублировать)
     db.run(`CREATE TABLE IF NOT EXISTS sent_news (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      news_id TEXT UNIQUE NOT NULL,      -- Уникальный ID новости
-      title TEXT NOT NULL,               -- Заголовок новости
-      url TEXT NOT NULL,                 -- Ссылка на новость
+      news_id TEXT UNIQUE NOT NULL,
+      title TEXT NOT NULL,
+      url TEXT NOT NULL,
       sent_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Таблица для хранения настроек бота
     db.run(`CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,              -- Название настройки
-      value TEXT NOT NULL                -- Значение настройки
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )`);
 
-    // 🆕 ТАБЛИЦА ДЛЯ ОТСЛЕЖИВАЕМЫХ КАНАЛОВ (откуда берем новости)
     db.run(`CREATE TABLE IF NOT EXISTS monitored_channels (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      channel_id TEXT UNIQUE NOT NULL,   -- ID канала
-      channel_username TEXT,             -- @username канала
-      channel_title TEXT,                -- Название канала
+      channel_id TEXT UNIQUE NOT NULL,
+      channel_username TEXT,
+      channel_title TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // 🆕 ТАБЛИЦА ДЛЯ ЦЕЛЕВЫХ КАНАЛОВ (куда отправляем новости)
     db.run(`CREATE TABLE IF NOT EXISTS target_channels (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      channel_id TEXT UNIQUE NOT NULL,   -- ID целевого канала
-      channel_username TEXT,             -- @username канала
-      channel_title TEXT,                -- Название канала
+      channel_id TEXT UNIQUE NOT NULL,
+      channel_username TEXT,
+      channel_title TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Таблица для пересланных сообщений (защита от дублей)
     db.run(`CREATE TABLE IF NOT EXISTS forwarded_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      original_message_id INTEGER NOT NULL,  -- ID оригинального сообщения
-      channel_id TEXT NOT NULL,              -- ID канала-источника
+      original_message_id INTEGER NOT NULL,
+      channel_id TEXT NOT NULL,
       forwarded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(original_message_id, channel_id) -- Один message_id из одного канала
+      UNIQUE(original_message_id, channel_id)
     )`, (err) => {
       if (err) {
         reject(err);
       } else {
-        // 📝 УСТАНАВЛИВАЕМ НАЧАЛЬНЫЕ НАСТРОЙКИ
         const defaultSettings = [
-          ['auto_post_enabled', 'true'],     // Автопостинг включен
-          ['check_interval', '30'],          // Интервал 30 минут
-          ['channel_monitoring_enabled', 'true']  // Мониторинг каналов включен
+          ['auto_post_enabled', 'true'],
+          ['check_interval', '30'],
+          ['channel_monitoring_enabled', 'true']
         ];
         
         const stmt = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
@@ -77,19 +67,15 @@ function initializeDB() {
   });
 }
 
-// 🔑 ФУНКЦИИ ДЛЯ РАБОТЫ С КЛЮЧЕВЫМИ СЛОВАМИ
-
-// Добавить ключевое слово
 function addKeyword(keyword) {
   return new Promise((resolve, reject) => {
     db.run('INSERT OR IGNORE INTO keywords (keyword) VALUES (?)', [keyword], function(err) {
       if (err) reject(err);
-      else resolve(this.changes); // Возвращает количество изменений
+      else resolve(this.changes);
     });
   });
 }
 
-// Удалить ключевое слово
 function removeKeyword(keyword) {
   return new Promise((resolve, reject) => {
     db.run('DELETE FROM keywords WHERE keyword = ?', [keyword], function(err) {
@@ -99,7 +85,6 @@ function removeKeyword(keyword) {
   });
 }
 
-// Получить все ключевые слова
 function getKeywords() {
   return new Promise((resolve, reject) => {
     db.all('SELECT keyword FROM keywords ORDER BY keyword', (err, rows) => {
@@ -109,9 +94,6 @@ function getKeywords() {
   });
 }
 
-// 📰 ФУНКЦИИ ДЛЯ РАБОТЫ С ОТПРАВЛЕННЫМИ НОВОСТЯМИ
-
-// Добавить отправленную новость
 function addSentNews(newsId, title, url) {
   return new Promise((resolve, reject) => {
     db.run(
@@ -125,36 +107,38 @@ function addSentNews(newsId, title, url) {
   });
 }
 
-// Проверить, отправлялась ли новость
 function isNewsSent(newsId) {
   return new Promise((resolve, reject) => {
     db.get('SELECT 1 FROM sent_news WHERE news_id = ?', [newsId], (err, row) => {
       if (err) reject(err);
-      else resolve(!!row); // true если найдена, false если нет
+      else resolve(!!row);
     });
   });
 }
 
-// 🎯 🆕 ФУНКЦИИ ДЛЯ РАБОТЫ С ЦЕЛЕВЫМИ КАНАЛАМИ (куда отправляем)
-
-// Добавить целевой канал
 function addTargetChannel(channelId, username = null, title = null) {
   return new Promise((resolve, reject) => {
+    console.log(`➕ Добавление целевого канала: "${channelId}"`);
+    
     db.run(
       'INSERT OR IGNORE INTO target_channels (channel_id, channel_username, channel_title) VALUES (?, ?, ?)',
       [channelId, username, title],
       function(err) {
-        if (err) reject(err);
-        else resolve(this.changes);
+        if (err) {
+          console.error('❌ Ошибка добавления целевого канала:', err);
+          reject(err);
+        } else {
+          console.log(`✅ Добавлено целевых каналов: ${this.changes}`);
+          resolve(this.changes);
+        }
       }
     );
   });
 }
 
-// Удалить целевой канал
 function removeTargetChannel(channelId) {
   return new Promise((resolve, reject) => {
-    console.log(`🗑️ SQLite: УДАЛЕНИЕ целевого канала ID: "${channelId}"`);
+    console.log(`🗑️ УДАЛЕНИЕ целевого канала ID: "${channelId}"`);
     
     db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
@@ -168,36 +152,38 @@ function removeTargetChannel(channelId) {
   });
 }
 
-// Получить все целевые каналы
 function getTargetChannels() {
   return new Promise((resolve, reject) => {
-    db.all('SELECT channel_id, channel_username, channel_title FROM target_channels ORDER BY channel_title', (err, rows) => {
+    db.all('SELECT channel_id, channel_username, channel_title FROM target_channels ORDER BY channel_id', (err, rows) => {
       if (err) reject(err);
       else resolve(rows);
     });
   });
 }
 
-// 📡 ФУНКЦИИ ДЛЯ РАБОТЫ С ОТСЛЕЖИВАЕМЫМИ КАНАЛАМИ (откуда берем)
-
-// Добавить отслеживаемый канал
 function addMonitoredChannel(channelId, username = null, title = null) {
   return new Promise((resolve, reject) => {
+    console.log(`➕ Добавление отслеживаемого канала: "${channelId}"`);
+    
     db.run(
       'INSERT OR IGNORE INTO monitored_channels (channel_id, channel_username, channel_title) VALUES (?, ?, ?)',
       [channelId, username, title],
       function(err) {
-        if (err) reject(err);
-        else resolve(this.changes);
+        if (err) {
+          console.error('❌ Ошибка добавления отслеживаемого канала:', err);
+          reject(err);
+        } else {
+          console.log(`✅ Добавлено отслеживаемых каналов: ${this.changes}`);
+          resolve(this.changes);
+        }
       }
     );
   });
 }
 
-// Удалить отслеживаемый канал
 function removeMonitoredChannel(channelId) {
   return new Promise((resolve, reject) => {
-    console.log(`🗑️ SQLite: УДАЛЕНИЕ отслеживаемого канала ID: "${channelId}"`);
+    console.log(`🗑️ УДАЛЕНИЕ отслеживаемого канала ID: "${channelId}"`);
     
     db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
@@ -211,19 +197,15 @@ function removeMonitoredChannel(channelId) {
   });
 }
 
-// Получить все отслеживаемые каналы
 function getMonitoredChannels() {
   return new Promise((resolve, reject) => {
-    db.all('SELECT channel_id, channel_username, channel_title FROM monitored_channels ORDER BY channel_title', (err, rows) => {
+    db.all('SELECT channel_id, channel_username, channel_title FROM monitored_channels ORDER BY channel_id', (err, rows) => {
       if (err) reject(err);
       else resolve(rows);
     });
   });
 }
 
-// 🔄 ФУНКЦИИ ДЛЯ ПЕРЕСЛАННЫХ СООБЩЕНИЙ
-
-// Добавить пересланное сообщение
 function addForwardedMessage(originalMessageId, channelId) {
   return new Promise((resolve, reject) => {
     db.run(
@@ -237,7 +219,6 @@ function addForwardedMessage(originalMessageId, channelId) {
   });
 }
 
-// Проверить, пересылалось ли сообщение
 function isMessageForwarded(originalMessageId, channelId) {
   return new Promise((resolve, reject) => {
     db.get(
@@ -251,9 +232,6 @@ function isMessageForwarded(originalMessageId, channelId) {
   });
 }
 
-// ⚙️ ФУНКЦИИ ДЛЯ РАБОТЫ С НАСТРОЙКАМИ
-
-// Получить настройку
 function getSetting(key) {
   return new Promise((resolve, reject) => {
     db.get('SELECT value FROM settings WHERE key = ?', [key], (err, row) => {
@@ -263,7 +241,6 @@ function getSetting(key) {
   });
 }
 
-// Установить настройку
 function setSetting(key, value) {
   return new Promise((resolve, reject) => {
     db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value], function(err) {
@@ -273,7 +250,6 @@ function setSetting(key, value) {
   });
 }
 
-// Подсчет пересланных сообщений
 function countForwardedMessages() {
   return new Promise((resolve, reject) => {
     db.get('SELECT COUNT(*) as count FROM forwarded_messages', (err, row) => {
@@ -283,7 +259,6 @@ function countForwardedMessages() {
   });
 }
 
-// Подсчет отправленных новостей
 function countSentNews() {
   return new Promise((resolve, reject) => {
     db.get('SELECT COUNT(*) as count FROM sent_news', (err, row) => {
@@ -293,40 +268,23 @@ function countSentNews() {
   });
 }
 
-// Получить канал по ID
-function getChannelById(channelId, tableName) {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM ${tableName} WHERE channel_id = ?`, [channelId], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-}
-
-// 📤 ЭКСПОРТ ВСЕХ ФУНКЦИЙ ДЛЯ ИСПОЛЬЗОВАНИЯ В ДРУГИХ ФАЙЛАХ
 module.exports = {
   initializeDB,
-  // Ключевые слова
   addKeyword,
   removeKeyword,
   getKeywords,
-  // Новости
   addSentNews,
   isNewsSent,
-  // 🆕 Целевые каналы
   addTargetChannel,
   removeTargetChannel,
   getTargetChannels,
-  // Отслеживаемые каналы
   addMonitoredChannel,
   removeMonitoredChannel,
   getMonitoredChannels,
-  // Пересланные сообщения
   addForwardedMessage,
   isMessageForwarded,
-  // Настройки
   getSetting,
   setSetting,
-  countForwardedMessages, // ✅ добавлено
+  countForwardedMessages,
   countSentNews
 };
