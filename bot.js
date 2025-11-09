@@ -314,10 +314,10 @@ async function sendTopNews() {
   }
 }
 
-// 🛠️ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ КАНАЛА С ДЕТАЛЬНОЙ ОТЛАДКОЙ
+// 🛠️ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ КАНАЛА С ПРАВИЛЬНОЙ ПРОВЕРКОЙ
 async function removeChannelWithDebug(ctx, userText, channelType) {
-  console.log(`🔍 Начало удаления канала типа: ${channelType}`);
-  console.log(`📝 Введенный текст: "${userText}"`);
+  console.log(`\n🔍 НАЧАЛО УДАЛЕНИЯ КАНАЛА ТИПА: ${channelType}`);
+  console.log(`📝 ВВЕДЕННЫЙ ТЕКСТ: "${userText}"`);
   
   const isTarget = channelType === 'target';
   const getChannelsFunc = isTarget ? db.getTargetChannels : db.getMonitoredChannels;
@@ -326,109 +326,118 @@ async function removeChannelWithDebug(ctx, userText, channelType) {
   const channelTypeName = isTarget ? 'целевой' : 'отслеживаемый';
 
   try {
-    // Получаем все каналы для отладки
-    const channels = await getChannelsFunc();
-    console.log(`📊 Найдено каналов в базе: ${channels.length}`);
+    // Получаем все каналы ДО удаления
+    const channelsBefore = await getChannelsFunc();
+    console.log(`📊 КАНАЛОВ ДО УДАЛЕНИЯ: ${channelsBefore.length}`);
     
-    if (channels.length === 0) {
+    if (channelsBefore.length === 0) {
       await ctx.reply(`📭 Нет ${channelTypeName} каналов для удаления`, successMenu);
       return true;
     }
 
-    channels.forEach((ch, index) => {
+    // Выводим отладочную информацию о каналах
+    console.log(`📋 СПИСОК КАНАЛОВ ДО УДАЛЕНИЯ:`);
+    channelsBefore.forEach((ch, index) => {
       console.log(`   ${index + 1}. ID: "${ch.channel_id}", Title: "${ch.channel_title}", Username: "${ch.channel_username}"`);
     });
 
+    let channelIdToRemove = null;
+    let channelInfo = '';
+
     // Случай 1: Пользователь ввел номер из списка
     const channelNumber = parseInt(userText);
-    if (!isNaN(channelNumber) && channelNumber >= 1 && channelNumber <= channels.length) {
-      console.log(`🔢 Пользователь ввел номер: ${channelNumber}`);
-      const channelToRemove = channels[channelNumber - 1];
-      console.log(`🎯 Канал для удаления по номеру:`, channelToRemove);
-      
-      const removeResult = await removeChannelFunc(channelToRemove.channel_id);
-      console.log(`✅ Результат удаления: ${removeResult} изменений`);
-      
-      if (removeResult > 0) {
-        await ctx.reply(`✅ ${channelTypeName} канал "${channelToRemove.channel_title || channelToRemove.channel_username || channelToRemove.channel_id}" удален!`, successMenu);
-        return true;
-      } else {
-        await ctx.reply(`❌ Не удалось удалить канал. Возможно, он уже был удален.`, successMenu);
-        return false;
+    if (!isNaN(channelNumber) && channelNumber >= 1 && channelNumber <= channelsBefore.length) {
+      console.log(`🔢 ПОЛЬЗОВАТЕЛЬ ВВЕЛ НОМЕР: ${channelNumber}`);
+      const channelToRemove = channelsBefore[channelNumber - 1];
+      channelIdToRemove = channelToRemove.channel_id;
+      channelInfo = `"${channelToRemove.channel_title || channelToRemove.channel_username || channelToRemove.channel_id}"`;
+      console.log(`🎯 КАНАЛ ДЛЯ УДАЛЕНИЯ ПО НОМЕРУ: ${channelInfo} (ID: ${channelIdToRemove})`);
+    }
+    // Случай 2: Прямой ID канала
+    else if (!channelIdToRemove) {
+      console.log(`🔍 ПРОБУЕМ НАЙТИ ПО ПРЯМОМУ ID: "${userText}"`);
+      const channelById = channelsBefore.find(ch => ch.channel_id === userText);
+      if (channelById) {
+        channelIdToRemove = channelById.channel_id;
+        channelInfo = `"${channelById.channel_title || channelById.channel_username || channelById.channel_id}"`;
+        console.log(`🎯 НАЙДЕН КАНАЛ ПО ID: ${channelInfo}`);
       }
     }
-
-    // Случай 2: Прямой ID канала
-    console.log(`🔍 Пробуем удалить по прямому ID: "${userText}"`);
-    let removeResult = await removeChannelFunc(userText);
-    console.log(`✅ Результат удаления по ID: ${removeResult} изменений`);
-    
-    if (removeResult > 0) {
-      await ctx.reply(`✅ ${channelTypeName} канал удален!`, successMenu);
-      return true;
-    }
-
     // Случай 3: Поиск по username или названию
-    console.log(`🔍 Пробуем найти канал по username/названию: "${userText}"`);
-    
-    const cleanUserInput = userText.replace('@', '').toLowerCase().trim();
-    
-    const channelToRemove = channels.find(ch => {
-      const cleanUsername = ch.channel_username ? ch.channel_username.replace('@', '').toLowerCase().trim() : '';
-      const cleanTitle = ch.channel_title ? ch.channel_title.toLowerCase().trim() : '';
+    else if (!channelIdToRemove) {
+      console.log(`🔍 ПРОБУЕМ НАЙТИ КАНАЛ ПО USERNAME/НАЗВАНИЮ: "${userText}"`);
       
-      console.log(`   Сравниваем: "${cleanUserInput}" с:`);
-      console.log(`     - ID: "${ch.channel_id}" → ${ch.channel_id === userText}`);
-      console.log(`     - Username: "${cleanUsername}" → ${cleanUsername === cleanUserInput}`);
-      console.log(`     - Title: "${cleanTitle}" → ${cleanTitle === cleanUserInput}`);
+      const cleanUserInput = userText.replace('@', '').toLowerCase().trim();
       
-      return (
-        ch.channel_id === userText || // Точное совпадение ID
-        cleanUsername === cleanUserInput || // Точное совпадение username
-        cleanTitle === cleanUserInput // Точное совпадение названия
-      );
-    });
+      const channelToRemove = channelsBefore.find(ch => {
+        const cleanUsername = ch.channel_username ? ch.channel_username.replace('@', '').toLowerCase().trim() : '';
+        const cleanTitle = ch.channel_title ? ch.channel_title.toLowerCase().trim() : '';
+        
+        return (
+          ch.channel_id === userText ||
+          cleanUsername === cleanUserInput ||
+          cleanTitle === cleanUserInput
+        );
+      });
 
-    if (channelToRemove) {
-      console.log(`🎯 Найден канал для удаления:`, channelToRemove);
-      removeResult = await removeChannelFunc(channelToRemove.channel_id);
-      console.log(`✅ Результат удаления: ${removeResult} изменений`);
-      
-      if (removeResult > 0) {
-        await ctx.reply(`✅ ${channelTypeName} канал "${channelToRemove.channel_title || channelToRemove.channel_username || channelToRemove.channel_id}" удален!`, successMenu);
-        return true;
-      } else {
-        await ctx.reply(`❌ Ошибка при удалении канала из базы данных`, successMenu);
-        return false;
+      if (channelToRemove) {
+        channelIdToRemove = channelToRemove.channel_id;
+        channelInfo = `"${channelToRemove.channel_title || channelToRemove.channel_username || channelToRemove.channel_id}"`;
+        console.log(`🎯 НАЙДЕН КАНАЛ ПО USERNAME/НАЗВАНИЮ: ${channelInfo}`);
       }
     }
 
     // Если канал не найден
-    console.log(`❌ Канал не найден ни по одному из критериев`);
-    
-    // Показываем понятный список каналов
-    const channelsList = channels.map((ch, index) => {
-      let info = `${index + 1}. `;
-      if (ch.channel_title) info += `"${ch.channel_title}"`;
-      if (ch.channel_username) info += ` (@${ch.channel_username})`;
-      info += ` - ID: ${ch.channel_id}`;
-      return info;
-    }).join('\n');
+    if (!channelIdToRemove) {
+      console.log(`❌ КАНАЛ НЕ НАЙДЕН НИ ПО ОДНОМУ ИЗ КРИТЕРИЕВ`);
+      
+      const channelsList = channelsBefore.map((ch, index) => {
+        let info = `${index + 1}. `;
+        if (ch.channel_title) info += `"${ch.channel_title}"`;
+        if (ch.channel_username) info += ` (@${ch.channel_username})`;
+        info += ` - ID: ${ch.channel_id}`;
+        return info;
+      }).join('\n');
 
-    await ctx.reply(
-      `❌ Канал "${userText}" не найден.\n\n` +
-      `📋 Доступные ${channelTypeName} каналы:\n${channelsList || 'Нет каналов'}\n\n` +
-      `💡 Для удаления введите:\n` +
-      `• Номер из списка (1, 2, 3...)\n` +
-      `• ID канала\n` +
-      `• @username канала\n` +
-      `• Название канала`,
-      backMenu
-    );
-    return false;
+      await ctx.reply(
+        `❌ Канал "${userText}" не найден.\n\n` +
+        `📋 Доступные ${channelTypeName} каналы:\n${channelsList}\n\n` +
+        `💡 Для удаления введите:\n` +
+        `• Номер из списка (1, 2, 3...)\n` +
+        `• ID канала\n` +
+        `• @username канала\n` +
+        `• Название канала`,
+        backMenu
+      );
+      return false;
+    }
+
+    // ВЫПОЛНЯЕМ УДАЛЕНИЕ
+    console.log(`🗑️ ВЫПОЛНЯЕМ УДАЛЕНИЕ КАНАЛА: ${channelInfo} (ID: ${channelIdToRemove})`);
+    
+    // Удаляем канал
+    const removeResult = await removeChannelFunc(channelIdToRemove);
+    console.log(`📊 РЕЗУЛЬТАТ SQLite УДАЛЕНИЯ: ${removeResult} изменений`);
+
+    // ПРОВЕРЯЕМ РЕЗУЛЬТАТ - читаем базу снова
+    const channelsAfter = await getChannelsFunc();
+    console.log(`📊 КАНАЛОВ ПОСЛЕ УДАЛЕНИЯ: ${channelsAfter.length}`);
+    
+    // Проверяем, действительно ли канал удален
+    const isStillExists = channelsAfter.some(ch => ch.channel_id === channelIdToRemove);
+    
+    if (isStillExists) {
+      console.log(`❌ ОШИБКА: КАНАЛ ВСЕ ЕЩЕ СУЩЕСТВУЕТ В БАЗЕ ПОСЛЕ УДАЛЕНИЯ!`);
+      await ctx.reply(`❌ Ошибка: не удалось удалить канал ${channelInfo} из базы данных`, successMenu);
+      return false;
+    } else {
+      console.log(`✅ УСПЕХ: КАНАЛ УДАЛЕН ИЗ БАЗЫ ДАННЫХ!`);
+      await ctx.reply(`✅ ${channelTypeName} канал ${channelInfo} удален!`, successMenu);
+      return true;
+    }
 
   } catch (error) {
-    console.error(`❌ Ошибка при удалении ${channelTypeName} канала:`, error);
+    console.error(`❌ ОШИБКА ПРИ УДАЛЕНИИ ${channelTypeName} КАНАЛА:`, error);
     await ctx.reply(`❌ Произошла ошибка при удалении канала: ${error.message}`, successMenu);
     return false;
   }
@@ -977,7 +986,7 @@ let autoPostInterval;
 
 async function startBot() {
   try {
-    console.log('🚀 Запуск бота с исправленным удалением каналов...');
+    console.log('🚀 Запуск бота с ИСПРАВЛЕННЫМ УДАЛЕНИЕМ КАНАЛОВ...');
     console.log('🌍 Режим: поиск на всех языках + мониторинг каналов + множественные целевые каналы');
     
     // Инициализация базы данных
@@ -1021,6 +1030,7 @@ async function startBot() {
     console.log('   🌐 Мониторинг Telegram-каналов');
     console.log('   📱 Удобное меню с кнопками');
     console.log('   🐛 Команда /debug_channels для отладки');
+    console.log('   🔧 ИСПРАВЛЕННОЕ УДАЛЕНИЕ КАНАЛОВ!');
     
   } catch (error) {
     console.error('❌ Критическая ошибка при запуске бота:', error);
