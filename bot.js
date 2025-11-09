@@ -252,6 +252,80 @@ async function removeChannelWithDebug(ctx, userText, type) {
   }
 }
 
+// ==========================
+// 🔄 ПЕРЕСЫЛКА СООБЩЕНИЙ ИЗ ОТСЛЕЖИВАЕМЫХ КАНАЛОВ
+// ==========================
+
+// Обработчик новых сообщений в отслеживаемых каналах
+bot.on('channel_post', async (ctx) => {
+  try {
+    const message = ctx.update.channel_post;
+    const chatId = String(message.chat.id);
+    
+    // Проверяем, что сообщение из отслеживаемого канала
+    const monitoredChannels = await db.getMonitoredChannels();
+    const isMonitored = monitoredChannels.some(ch => ch.channel_id === chatId);
+    
+    if (!isMonitored) return;
+
+    // Проверяем, не пересылали ли уже это сообщение
+    const isForwarded = await db.isMessageForwarded(message.message_id, chatId);
+    if (isForwarded) {
+      console.log(`Сообщение ${message.message_id} из канала ${chatId} уже переслано.`);
+      return;
+    }
+
+    // Получаем целевые каналы
+    const targetChannels = await db.getTargetChannels();
+    if (targetChannels.length === 0) {
+      console.log('Нет целевых каналов для пересылки.');
+      return;
+    }
+
+    // Получаем ключевые слова для фильтрации
+    const keywords = await db.getKeywords();
+    
+    // Проверяем текст сообщения на ключевые слова
+    const messageText = message.text || message.caption || '';
+    const hasKeyword = keywords.length === 0 || 
+                      keywords.some(keyword => 
+                        messageText.toLowerCase().includes(keyword.toLowerCase())
+                      );
+
+    if (!hasKeyword && keywords.length > 0) {
+      console.log(`Сообщение не содержит ключевых слов: "${messageText.substring(0, 50)}..."`);
+      return;
+    }
+
+    // Пересылаем сообщение в каждый целевой канал
+    for (const targetChannel of targetChannels) {
+      try {
+        await ctx.telegram.forwardMessage(
+          targetChannel.channel_id,
+          chatId,
+          message.message_id
+        );
+        
+        // Записываем в базу факт пересылки
+        await db.addForwardedMessage(message.message_id, chatId);
+        
+        console.log(`✅ Переслано сообщение ${message.message_id} из ${chatId} в ${targetChannel.channel_id}`);
+        
+      } catch (err) {
+        console.error(`❌ Ошибка при пересылке в канал ${targetChannel.channel_id}:`, err);
+      }
+    }
+
+  } catch (err) {
+    console.error('❌ Ошибка в обработчике channel_post:', err);
+  }
+});
+
+// Также обрабатываем обычные сообщения (если нужно)
+bot.on('message', async (ctx) => {
+  // Эта функция уже есть, но добавьте проверку на пересылку здесь тоже,
+  // если хотите пересылать сообщения из групп, а не только каналов
+});
 
 // ==========================
 // 🚀 ЗАПУСК
