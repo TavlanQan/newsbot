@@ -17,11 +17,8 @@ class NewsService {
   constructor() {
     this.parser = new Parser({
       timeout: 10000,
-      customFields: {
-        item: [
-          ['content:encoded', 'contentEncoded'],
-          ['description', 'description']
-        ]
+      requestOptions: {
+        timeout: 10000
       }
     });
     this.monitoringInterval = null;
@@ -29,13 +26,14 @@ class NewsService {
     this.sendFunction = null;
   }
 
-  async initialize(sendFunction = null) {
-    this.sendFunction = sendFunction;
+  async initialize() {
     log('📰 Инициализация сервиса новостей...');
+    // Отложим проверку RSS до первого запуска мониторинга
   }
 
   setSendFunction(sendFunction) {
     this.sendFunction = sendFunction;
+    log('✅ Функция отправки установлена в NewsService');
   }
 
   async startMonitoring() {
@@ -69,11 +67,10 @@ class NewsService {
 
   async checkAllFeeds() {
     if (!this.isMonitoring) {
-      log('⏹️ Мониторинг отключен, пропускаем проверку RSS');
       return;
     }
 
-    log('🔍 Проверка RSS-лент...');
+    log('🔍 Начинаем проверку всех RSS-лент...');
     
     for (const feedUrl of config.RSS_FEEDS) {
       try {
@@ -85,32 +82,35 @@ class NewsService {
       }
     }
     
-    log('✅ Проверка RSS-лент завершена');
+    log('✅ Проверка RSS завершена');
   }
 
   async processFeed(feedUrl) {
     try {
       const feed = await this.parser.parseURL(feedUrl);
-      log(`📋 Найдено ${feed.items.length} новостей в ${feed.title || feedUrl}`);
+      log(`📋 RSS: ${feed.title || feedUrl} - найдено ${feed.items?.length || 0} новостей`);
+
+      if (!feed.items || feed.items.length === 0) {
+        return;
+      }
 
       const keywords = await db.getKeywords();
-      let processedCount = 0;
       
-      for (const item of feed.items) {
+      // Обрабатываем только последние 5 новостей чтобы не перегружать
+      const recentItems = feed.items.slice(0, 5);
+      
+      for (const item of recentItems) {
         // Проверяем, не отправляли ли мы уже эту новость
         const newsId = item.guid || item.link;
+        if (!newsId) continue;
+
         const isSent = await db.isNewsSent(newsId);
         if (isSent) continue;
 
         // Проверяем соответствие ключевым словам
         if (this.matchesKeywords(item, keywords)) {
-          await this.processNewsItem(item, feed.title);
-          processedCount++;
+          await this.processNewsItem(item, feed.title || feedUrl);
         }
-      }
-      
-      if (processedCount > 0) {
-        log(`✅ Обработано ${processedCount} новых новостей из ${feed.title || feedUrl}`);
       }
     } catch (error) {
       throw new Error(`Ошибка парсинга ${feedUrl}: ${error.message}`);
@@ -118,7 +118,7 @@ class NewsService {
   }
 
   matchesKeywords(item, keywords) {
-    if (keywords.length === 0) return true; // Если нет ключевых слов, отправляем все
+    if (keywords.length === 0) return true;
 
     const content = `${item.title} ${item.contentSnippet || ''} ${item.content || ''} ${item.description || ''}`.toLowerCase();
     
@@ -135,29 +135,23 @@ class NewsService {
       if (this.sendFunction) {
         await this.sendFunction(message);
         log(`✅ Отправлена новость: ${item.title.substring(0, 100)}...`);
+        
+        // Помечаем как отправленную
+        await db.addSentNews(item.guid || item.link, item.title, item.link);
       } else {
-        log('⚠️ Функция отправки не установлена, новость не отправлена');
-        log(`📰 Новость: ${item.title}`);
-        log(`🔗 Ссылка: ${item.link}`);
+        log('❌ Функция отправки не установлена, новость не отправлена');
       }
-      
-      // Помечаем как отправленную
-      await db.addSentNews(item.guid || item.link, item.title, item.link);
-      
     } catch (error) {
       log(`❌ Ошибка обработки новости "${item.title}": ${error.message}`);
     }
   }
 
   formatNewsMessage(item, feedTitle) {
-    // Ограничиваем длину контента
     let content = item.contentSnippet || item.description || item.content || '';
-    if (content.length > 500) {
-      content = content.substring(0, 500) + '...';
-    }
-    
-    // Очищаем HTML теги для простого текста
     content = content.replace(/<[^>]*>/g, '').trim();
+    if (content.length > 300) {
+      content = content.substring(0, 300) + '...';
+    }
     
     return `
 📰 <b>${this.escapeHtml(item.title)}</b>
@@ -165,8 +159,7 @@ class NewsService {
 ${this.escapeHtml(content)}
 
 🔗 <a href="${item.link}">Читать полностью</a>
-📅 ${new Date(item.pubDate || item.isoDate || '').toLocaleDateString('ru-RU')}
-📋 Источник: ${this.escapeHtml(feedTitle || 'RSS')}
+📋 Источник: ${this.escapeHtml(feedTitle)}
     `.trim();
   }
 
