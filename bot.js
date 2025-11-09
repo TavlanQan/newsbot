@@ -119,6 +119,55 @@ bot.hears('🗑️ Удалить отслеживаемый канал', (ctx) 
   ctx.reply('🗑️ Введите @username, ID или часть названия канала для удаления:');
 });
 
+// 📊 Статистика
+bot.hears('📈 Статистика', async (ctx) => {
+  try {
+    // Количество ключевых слов
+    const keywords = await db.getKeywords();
+    const keywordsCount = keywords.length;
+
+    // Количество целевых каналов
+    const targetChannels = await db.getTargetChannels();
+    const targetChannelsCount = targetChannels.length;
+
+    // Количество отслеживаемых каналов
+    const monitoredChannels = await db.getMonitoredChannels();
+    const monitoredChannelsCount = monitoredChannels.length;
+
+    // Количество пересланных сообщений
+    const forwardedCount = await new Promise((resolve, reject) => {
+      db.db.get('SELECT COUNT(*) as count FROM forwarded_messages', (err, row) => {
+        if (err) reject(err);
+        else resolve(row.count);
+      });
+    });
+
+    // Количество отправленных новостей
+    const sentNewsCount = await new Promise((resolve, reject) => {
+      db.db.get('SELECT COUNT(*) as count FROM sent_news', (err, row) => {
+        if (err) reject(err);
+        else resolve(row.count);
+      });
+    });
+
+    // Отправляем статистику
+    const msg = `
+📊 Статистика бота:
+
+🗝️ Ключевых слов: ${keywordsCount}
+🎯 Целевых каналов: ${targetChannelsCount}
+📡 Отслеживаемых каналов: ${monitoredChannelsCount}
+📤 Пересланных сообщений: ${forwardedCount}
+📰 Отправленных новостей: ${sentNewsCount}
+    `;
+    ctx.reply(msg, mainMenu);
+
+  } catch (err) {
+    console.error('❌ Ошибка при получении статистики:', err);
+    ctx.reply('⚠️ Не удалось получить статистику.');
+  }
+});
+
 
 // ==========================
 // 🧠 ОБРАБОТКА ВВОДА ПОЛЬЗОВАТЕЛЯ
