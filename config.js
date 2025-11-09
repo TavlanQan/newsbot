@@ -18,7 +18,6 @@ module.exports = {
     'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
     'https://www.theverge.com/rss/index.xml',
     'https://www.vox.com/rss/index.xml',
-    'zamankbr.ru/taxonomy/term/1/feed https://share.google/RvNgjS7txZdjmLYuM',
     'https://www.ipgu.org/rss',
     'https://nativenewsonline.net/currents/feed/rss/',
     'https://media.rss.com/sovereignstories/feed.xml',
