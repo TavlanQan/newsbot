@@ -15,13 +15,27 @@ function log(msg) {
 
 class NewsService {
   constructor() {
-    this.parser = new Parser();
+    this.parser = new Parser({
+      timeout: 10000,
+      customFields: {
+        item: [
+          ['content:encoded', 'contentEncoded'],
+          ['description', 'description']
+        ]
+      }
+    });
     this.monitoringInterval = null;
     this.isMonitoring = false;
+    this.sendFunction = null;
   }
 
-  async initialize() {
+  async initialize(sendFunction = null) {
+    this.sendFunction = sendFunction;
     log('📰 Инициализация сервиса новостей...');
+  }
+
+  setSendFunction(sendFunction) {
+    this.sendFunction = sendFunction;
   }
 
   async startMonitoring() {
@@ -54,7 +68,10 @@ class NewsService {
   }
 
   async checkAllFeeds() {
-    if (!this.isMonitoring) return;
+    if (!this.isMonitoring) {
+      log('⏹️ Мониторинг отключен, пропускаем проверку RSS');
+      return;
+    }
 
     log('🔍 Проверка RSS-лент...');
     
@@ -67,6 +84,8 @@ class NewsService {
         log(`❌ Ошибка обработки RSS-ленты ${feedUrl}: ${error.message}`);
       }
     }
+    
+    log('✅ Проверка RSS-лент завершена');
   }
 
   async processFeed(feedUrl) {
@@ -75,16 +94,23 @@ class NewsService {
       log(`📋 Найдено ${feed.items.length} новостей в ${feed.title || feedUrl}`);
 
       const keywords = await db.getKeywords();
+      let processedCount = 0;
       
       for (const item of feed.items) {
         // Проверяем, не отправляли ли мы уже эту новость
-        const isSent = await db.isNewsSent(item.guid || item.link);
+        const newsId = item.guid || item.link;
+        const isSent = await db.isNewsSent(newsId);
         if (isSent) continue;
 
         // Проверяем соответствие ключевым словам
         if (this.matchesKeywords(item, keywords)) {
           await this.processNewsItem(item, feed.title);
+          processedCount++;
         }
+      }
+      
+      if (processedCount > 0) {
+        log(`✅ Обработано ${processedCount} новых новостей из ${feed.title || feedUrl}`);
       }
     } catch (error) {
       throw new Error(`Ошибка парсинга ${feedUrl}: ${error.message}`);
@@ -94,7 +120,7 @@ class NewsService {
   matchesKeywords(item, keywords) {
     if (keywords.length === 0) return true; // Если нет ключевых слов, отправляем все
 
-    const content = `${item.title} ${item.contentSnippet || ''} ${item.content || ''}`.toLowerCase();
+    const content = `${item.title} ${item.contentSnippet || ''} ${item.content || ''} ${item.description || ''}`.toLowerCase();
     
     return keywords.some(keyword => 
       content.includes(keyword.toLowerCase())
@@ -105,10 +131,15 @@ class NewsService {
     try {
       const message = this.formatNewsMessage(item, feedTitle);
       
-      // Здесь должна быть логика отправки в телеграм каналы
-      // Временно просто логируем
-      log(`📰 Новая новость: ${item.title}`);
-      log(`🔗 Ссылка: ${item.link}`);
+      // Отправляем сообщение в целевые каналы
+      if (this.sendFunction) {
+        await this.sendFunction(message);
+        log(`✅ Отправлена новость: ${item.title.substring(0, 100)}...`);
+      } else {
+        log('⚠️ Функция отправки не установлена, новость не отправлена');
+        log(`📰 Новость: ${item.title}`);
+        log(`🔗 Ссылка: ${item.link}`);
+      }
       
       // Помечаем как отправленную
       await db.addSentNews(item.guid || item.link, item.title, item.link);
@@ -119,15 +150,34 @@ class NewsService {
   }
 
   formatNewsMessage(item, feedTitle) {
+    // Ограничиваем длину контента
+    let content = item.contentSnippet || item.description || item.content || '';
+    if (content.length > 500) {
+      content = content.substring(0, 500) + '...';
+    }
+    
+    // Очищаем HTML теги для простого текста
+    content = content.replace(/<[^>]*>/g, '').trim();
+    
     return `
-📰 ${item.title}
+📰 <b>${this.escapeHtml(item.title)}</b>
 
-${item.contentSnippet || item.content || ''}
+${this.escapeHtml(content)}
 
-🔗 ${item.link}
-📅 ${new Date(item.pubDate || '').toLocaleDateString('ru-RU')}
-📋 Источник: ${feedTitle || 'RSS'}
+🔗 <a href="${item.link}">Читать полностью</a>
+📅 ${new Date(item.pubDate || item.isoDate || '').toLocaleDateString('ru-RU')}
+📋 Источник: ${this.escapeHtml(feedTitle || 'RSS')}
     `.trim();
+  }
+
+  escapeHtml(text) {
+    if (!text) return '';
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
   }
 }
 

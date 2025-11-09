@@ -329,6 +329,15 @@ function countSentNews() {
   });
 }
 
+// Получить канал по ID
+function getChannelById(channelId, tableName) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM ${tableName} WHERE channel_id = ?`, [channelId], (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
 
 // 📤 ЭКСПОРТ ВСЕХ ФУНКЦИЙ ДЛЯ ИСПОЛЬЗОВАНИЯ В ДРУГИХ ФАЙЛАХ
 module.exports = {

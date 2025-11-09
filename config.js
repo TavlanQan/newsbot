@@ -28,7 +28,6 @@ module.exports = {
     'http://217.154.1.212:8080/rss/UChXE1ElIcWSDYL7t-7Xe0iQ.xml',
     'http://217.154.1.212:8080/rss/UCU7CcJqFh6WT6FMicmCR5hA.xml',
     'http://217.154.1.212:8080/rss/UCwm0Mvq8GOt5B1wT5Lc9pvg.xml',
-    'http://217.154.1.212:8080/rss/UCEEaY9lmZjMS81d59WHa1Og.xml',
     'http://217.154.1.212:8080/rss/UCV3QBORgbX-tilCsRkmYlfQ.xml',
     'http://217.154.1.212:8080/rss/UCPGq5JbnJ4Ax668we-WjP0w.xml',
     'http://217.154.1.212:8080/rss/UCwhtt0GHo1qAv1ffq_FYY5w.xml',

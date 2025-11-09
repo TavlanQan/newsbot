@@ -55,6 +55,35 @@ let isForwardingActive = false;
 // 🔄 ФУНКЦИИ ПЕРЕСЫЛКИ СООБЩЕНИЙ
 // ==========================
 
+// Функция для отправки сообщения в целевые каналы
+async function sendMessageToTargetChannels(message, options = {}) {
+  try {
+    const targetChannels = await db.getTargetChannels();
+    
+    if (targetChannels.length === 0) {
+      log('⚠️ Нет целевых каналов для отправки сообщения');
+      return;
+    }
+
+    for (const targetChannel of targetChannels) {
+      try {
+        await bot.telegram.sendMessage(targetChannel.channel_id, message, {
+          parse_mode: 'HTML',
+          ...options
+        });
+        log(`✅ Отправлено сообщение в канал ${targetChannel.channel_id}`);
+        
+        // Задержка между отправками чтобы избежать лимитов
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        log(`❌ Ошибка отправки в канал ${targetChannel.channel_id}: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    log(`❌ Ошибка в sendMessageToTargetChannels: ${error.message}`);
+  }
+}
+
 // Функция для пересылки сообщений из отслеживаемых каналов
 async function forwardMessageFromChannel(ctx, channelId, messageId) {
   try {
@@ -64,6 +93,29 @@ async function forwardMessageFromChannel(ctx, channelId, messageId) {
     if (isAlreadyForwarded) {
       log(`⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано`);
       return;
+    }
+
+    // Получаем ключевые слова для фильтрации
+    const keywords = await db.getKeywords();
+    
+    // Получаем текст сообщения для проверки по ключевым словам
+    let messageText = '';
+    try {
+      const message = await ctx.telegram.getMessage(channelId, messageId);
+      messageText = message.text || message.caption || '';
+    } catch (e) {
+      log(`⚠️ Не удалось получить текст сообщения ${messageId}: ${e.message}`);
+    }
+
+    // Если есть ключевые слова, проверяем соответствие
+    if (keywords.length > 0 && messageText) {
+      const hasKeyword = keywords.some(keyword => 
+        messageText.toLowerCase().includes(keyword.toLowerCase())
+      );
+      if (!hasKeyword) {
+        log(`⏩ Сообщение ${messageId} не содержит ключевых слов, пропускаем`);
+        return;
+      }
     }
 
     for (const targetChannel of targetChannels) {
@@ -97,14 +149,12 @@ async function checkAndForwardMessages() {
     log('🔄 Проверка новых сообщений в отслеживаемых каналах...');
     
     const monitoredChannels = await db.getMonitoredChannels();
-    const keywords = await db.getKeywords();
     
     for (const channel of monitoredChannels) {
       try {
-        // Получаем последние сообщения из канала
-        // Note: В реальном приложении нужно использовать Telegram API для получения сообщений
-        // Это упрощенная реализация для демонстрации
         log(`🔍 Проверка канала: ${channel.channel_title || channel.channel_id}`);
+        // Здесь можно добавить логику получения последних сообщений из канала
+        // через Telegram API, если это необходимо
       } catch (error) {
         log(`❌ Ошибка при проверке канала ${channel.channel_id}: ${error.message}`);
       }
@@ -123,7 +173,7 @@ setInterval(checkAndForwardMessages, 60000); // Проверка каждую м
 
 bot.start(async (ctx) => {
   await db.initializeDB();
-  await newsService.initialize();
+  await newsService.initialize(sendMessageToTargetChannels);
   ctx.reply('👋 Привет! Я бот для мониторинга и пересылки новостей.', mainMenu);
 });
 
@@ -248,14 +298,42 @@ bot.on('channel_post', async (ctx) => {
     const monitoredChannels = await db.getMonitoredChannels();
     const isMonitored = monitoredChannels.some(ch => 
       ch.channel_id === channelId || 
-      ch.channel_username === channelPost.chat.username
+      (ch.channel_username && ch.channel_username === channelPost.chat.username)
     );
 
     if (isMonitored) {
+      log(`📨 Новое сообщение в отслеживаемом канале ${channelId}: ${messageId}`);
       await forwardMessageFromChannel(ctx, channelId, messageId);
     }
   } catch (error) {
     log(`❌ Ошибка обработки channel_post: ${error.message}`);
+  }
+});
+
+// Обработчик новых постов в каналах (альтернативный вариант)
+bot.on('message', async (ctx) => {
+  // Обрабатываем только сообщения из каналов
+  if (ctx.message && ctx.message.chat && ctx.message.chat.type === 'channel') {
+    if (!isForwardingActive) return;
+
+    try {
+      const channelId = ctx.message.chat.id.toString();
+      const messageId = ctx.message.message_id;
+
+      // Проверяем, отслеживается ли этот канал
+      const monitoredChannels = await db.getMonitoredChannels();
+      const isMonitored = monitoredChannels.some(ch => 
+        ch.channel_id === channelId || 
+        (ch.channel_username && ch.channel_username === ctx.message.chat.username)
+      );
+
+      if (isMonitored) {
+        log(`📨 Новое сообщение в отслеживаемом канале ${channelId}: ${messageId}`);
+        await forwardMessageFromChannel(ctx, channelId, messageId);
+      }
+    } catch (error) {
+      log(`❌ Ошибка обработки сообщения из канала: ${error.message}`);
+    }
   }
 });
 
@@ -267,6 +345,9 @@ bot.on('message', async (ctx) => {
   const state = userStates.get(userId);
   const text = ctx.message.text?.trim();
   if (!text) return;
+
+  // Пропускаем сообщения из каналов
+  if (ctx.message.chat.type === 'channel') return;
 
   try {
     // ➕ Добавление ключевого слова
@@ -370,7 +451,7 @@ async function removeChannelWithDebug(ctx, userText, type) {
 async function startBot() {
   try {
     await db.initializeDB();
-    await newsService.initialize();
+    await newsService.initialize(sendMessageToTargetChannels);
     bot.launch();
     log('✅ Бот запущен и готов к работе.');
     log('🔄 Для начала пересылки используйте команду "Запустить пересылку"');
