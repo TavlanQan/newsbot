@@ -1,198 +1,211 @@
-const { Telegraf } = require('telegraf');
+// ==========================
+// 🤖 TELEGRAM BOT
+// ==========================
+const { Telegraf, Markup } = require('telegraf');
 const db = require('./db');
+const config = require('./config');
 const fs = require('fs');
 const path = require('path');
 
-const bot = new Telegraf('ТОКЕН_ТВОЕГО_БОТА');
+// Логирование в файл
+const logStream = fs.createWriteStream(path.join(__dirname, 'bot.log'), { flags: 'a' });
+function log(msg) {
+  const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
+  logStream.write(`[${timestamp}] ${msg}\n`);
+  console.log(msg);
+}
 
-// Состояния пользователей
+// Инициализация бота
+const bot = new Telegraf(config.BOT_TOKEN);
+
+// Временное хранение состояния пользователя (например, ожидание ввода)
 const userStates = new Map();
 
 // Главное меню
-const mainMenu = {
-  reply_markup: {
-    keyboard: [
-      ['📚 Ключевые слова', '🎯 Целевые каналы'],
-      ['📡 Отслеживаемые каналы'],
-      ['⚙️ Настройки']
-    ],
-    resize_keyboard: true
-  }
-};
+const mainMenu = Markup.keyboard([
+  ['⚙️ Настройки', '🗝️ Ключевые слова'],
+  ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
+]).resize();
 
 // Меню ключевых слов
-const keywordsMenu = {
-  reply_markup: {
-    keyboard: [
-      ['➕ Добавить слово', '🗑️ Удалить слово'],
-      ['⬅️ Назад']
-    ],
-    resize_keyboard: true
-  }
-};
+const keywordsMenu = Markup.keyboard([
+  ['➕ Добавить ключевое слово', '🗑️ Удалить ключевое слово'],
+  ['⬅️ Назад']
+]).resize();
 
 // Меню целевых каналов
-const targetChannelsMenu = {
-  reply_markup: {
-    keyboard: [
-      ['➕ Добавить целевой канал', '🗑️ Удалить целевой канал'],
-      ['⬅️ Назад']
-    ],
-    resize_keyboard: true
-  }
-};
+const targetChannelsMenu = Markup.keyboard([
+  ['➕ Добавить целевой канал', '🗑️ Удалить целевой канал'],
+  ['⬅️ Назад']
+]).resize();
 
-// Меню отслеживаемых каналов
-const monitoredChannelsMenu = {
-  reply_markup: {
-    keyboard: [
-      ['➕ Добавить отслеживаемый канал', '🗑️ Удалить отслеживаемый канал'],
-      ['⬅️ Назад']
-    ],
-    resize_keyboard: true
-  }
-};
+// Меню мониторинга каналов
+const monitoredChannelsMenu = Markup.keyboard([
+  ['➕ Добавить отслеживаемый канал', '🗑️ Удалить отслеживаемый канал'],
+  ['⬅️ Назад']
+]).resize();
 
-// Старт
-bot.start((ctx) => {
-  ctx.reply('👋 Привет! Это бот новостей.', mainMenu);
+
+// ==========================
+// ⚙️ ОБРАБОТЧИКИ КОМАНД
+// ==========================
+
+bot.start(async (ctx) => {
+  await db.initializeDB();
+  ctx.reply('👋 Привет! Я бот для мониторинга и пересылки новостей.', mainMenu);
 });
 
 // Главное меню
-bot.hears('⬅️ Назад', (ctx) => {
-  userStates.delete(ctx.from.id);
-  ctx.reply('Главное меню:', mainMenu);
-});
+bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
 
-// === 📚 КЛЮЧЕВЫЕ СЛОВА ===
-bot.hears('📚 Ключевые слова', async (ctx) => {
+// Меню ключевых слов
+bot.hears('🗝️ Ключевые слова', async (ctx) => {
   const keywords = await db.getKeywords();
-  const list = keywords.length ? keywords.join(', ') : 'Пока нет слов.';
-  ctx.reply(`📖 Список ключевых слов:\n${list}`, keywordsMenu);
+  const list = keywords.length ? keywords.map(k => `🔹 ${k}`).join('\n') : '— нет —';
+  ctx.reply(`📜 Текущие ключевые слова:\n${list}`, keywordsMenu);
 });
 
-bot.hears('➕ Добавить слово', (ctx) => {
+// Добавление ключевого слова
+bot.hears('➕ Добавить ключевое слово', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_keyword_add');
-  ctx.reply('Введите ключевое слово для добавления:');
+  ctx.reply('✏️ Введите ключевое слово для добавления:');
 });
 
-bot.hears('🗑️ Удалить слово', (ctx) => {
+// Удаление ключевого слова
+bot.hears('🗑️ Удалить ключевое слово', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_keyword_remove');
-  ctx.reply('Введите ключевое слово для удаления:');
+  ctx.reply('🗑️ Введите ключевое слово для удаления:');
 });
 
-// === 🎯 ЦЕЛЕВЫЕ КАНАЛЫ ===
+// Меню целевых каналов
 bot.hears('🎯 Целевые каналы', async (ctx) => {
   const channels = await db.getTargetChannels();
   const list = channels.length
-    ? channels.map(c => `• ${c.channel_title || c.channel_username || c.channel_id}`).join('\n')
-    : 'Нет целевых каналов.';
+    ? channels.map(c => `🔹 ${c.channel_title || ''} (${c.channel_username || c.channel_id})`).join('\n')
+    : '— нет —';
   ctx.reply(`🎯 Целевые каналы:\n${list}`, targetChannelsMenu);
 });
 
+// Добавление целевого канала
 bot.hears('➕ Добавить целевой канал', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_target_channel_add');
-  ctx.reply('Введите ID, username или ссылку канала:');
+  ctx.reply('✏️ Введите @username или ID канала для добавления:');
 });
 
+// Удаление целевого канала
 bot.hears('🗑️ Удалить целевой канал', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_target_channel_remove');
-  ctx.reply('Введите ID, username или название канала для удаления:');
+  ctx.reply('🗑️ Введите @username, ID или часть названия канала для удаления:');
 });
 
-// === 📡 ОТСЛЕЖИВАЕМЫЕ КАНАЛЫ ===
-bot.hears('📡 Отслеживаемые каналы', async (ctx) => {
+// Меню мониторинга каналов
+bot.hears('📡 Мониторинг каналов', async (ctx) => {
   const channels = await db.getMonitoredChannels();
   const list = channels.length
-    ? channels.map(c => `• ${c.channel_title || c.channel_username || c.channel_id}`).join('\n')
-    : 'Нет отслеживаемых каналов.';
+    ? channels.map(c => `🔹 ${c.channel_title || ''} (${c.channel_username || c.channel_id})`).join('\n')
+    : '— нет —';
   ctx.reply(`📡 Отслеживаемые каналы:\n${list}`, monitoredChannelsMenu);
 });
 
+// Добавление отслеживаемого канала
 bot.hears('➕ Добавить отслеживаемый канал', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_monitored_channel_add');
-  ctx.reply('Введите ID, username или ссылку отслеживаемого канала:');
+  ctx.reply('✏️ Введите @username или ID канала для добавления:');
 });
 
+// Удаление отслеживаемого канала
 bot.hears('🗑️ Удалить отслеживаемый канал', (ctx) => {
   userStates.set(ctx.from.id, 'waiting_for_monitored_channel_remove');
-  ctx.reply('Введите ID, username или название канала для удаления:');
+  ctx.reply('🗑️ Введите @username, ID или часть названия канала для удаления:');
 });
 
-// === 📤 ОБРАБОТКА СООБЩЕНИЙ ДЛЯ СОСТОЯНИЙ ===
+
+// ==========================
+// 🧠 ОБРАБОТКА ВВОДА ПОЛЬЗОВАТЕЛЯ
+// ==========================
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   const state = userStates.get(userId);
   const text = ctx.message.text?.trim();
-
   if (!text) return;
 
-  // ➕ Добавление слова
-  if (state === 'waiting_for_keyword_add') {
-    await db.addKeyword(text);
-    userStates.delete(userId);
-    const keywords = await db.getKeywords();
-    ctx.reply(`✅ Добавлено слово "${text}".\n\n📖 Все слова:\n${keywords.join(', ')}`, keywordsMenu);
-    return;
-  }
-
-  // 🗑️ Удаление слова
-  if (state === 'waiting_for_keyword_remove') {
-    const keywords = await db.getKeywords();
-    const toRemove = keywords.find(k => k.toLowerCase() === text.toLowerCase());
-    if (!toRemove) {
-      ctx.reply(`❌ Слово "${text}" не найдено.`, keywordsMenu);
+  try {
+    // ➕ Добавление ключевого слова
+    if (state === 'waiting_for_keyword_add') {
+      const added = await db.addKeyword(text);
+      userStates.delete(userId);
+      if (added > 0) ctx.reply(`✅ Ключевое слово "${text}" добавлено.`, keywordsMenu);
+      else ctx.reply(`⚠️ Слово "${text}" уже существует.`, keywordsMenu);
       return;
     }
-    await db.removeKeyword(toRemove);
-    userStates.delete(userId);
-    ctx.reply(`✅ Удалено слово "${toRemove}".`, keywordsMenu);
-    return;
-  }
 
-  // ➕ Добавление целевого канала
-  if (state === 'waiting_for_target_channel_add') {
-    await db.addTargetChannel(text);
-    userStates.delete(userId);
-    ctx.reply(`✅ Целевой канал "${text}" добавлен.`, targetChannelsMenu);
-    return;
-  }
+    // 🗑️ Удаление ключевого слова
+    if (state === 'waiting_for_keyword_remove') {
+      const keywords = await db.getKeywords();
+      const keywordToRemove = keywords.find(k => k.toLowerCase() === text.toLowerCase());
+      if (!keywordToRemove) {
+        ctx.reply(`❌ Слово "${text}" не найдено.`, keywordsMenu);
+      } else {
+        await db.removeKeyword(keywordToRemove);
+        ctx.reply(`✅ Ключевое слово "${keywordToRemove}" удалено.`, keywordsMenu);
+      }
+      userStates.delete(userId);
+      return;
+    }
 
-  // ➕ Добавление отслеживаемого канала
-  if (state === 'waiting_for_monitored_channel_add') {
-    await db.addMonitoredChannel(text);
-    userStates.delete(userId);
-    ctx.reply(`✅ Отслеживаемый канал "${text}" добавлен.`, monitoredChannelsMenu);
-    return;
-  }
+    // ➕ Добавление целевого канала
+    if (state === 'waiting_for_target_channel_add') {
+      const added = await db.addTargetChannel(text);
+      userStates.delete(userId);
+      ctx.reply(added > 0 ? `✅ Канал "${text}" добавлен.` : `⚠️ Канал "${text}" уже есть.`, targetChannelsMenu);
+      return;
+    }
 
-  // 🗑️ Удаление целевого канала
-  if (state === 'waiting_for_target_channel_remove') {
-    await removeChannelWithDebug(ctx, text, 'target');
-    userStates.delete(userId);
-    return;
-  }
+    // ➕ Добавление отслеживаемого канала
+    if (state === 'waiting_for_monitored_channel_add') {
+      const added = await db.addMonitoredChannel(text);
+      userStates.delete(userId);
+      ctx.reply(added > 0 ? `✅ Канал "${text}" добавлен.` : `⚠️ Канал "${text}" уже есть.`, monitoredChannelsMenu);
+      return;
+    }
 
-  // 🗑️ Удаление отслеживаемого канала
-  if (state === 'waiting_for_monitored_channel_remove') {
-    await removeChannelWithDebug(ctx, text, 'monitored');
-    userStates.delete(userId);
-    return;
+    // 🗑️ Удаление целевого канала
+    if (state === 'waiting_for_target_channel_remove') {
+      await removeChannelWithDebug(ctx, text, 'target');
+      userStates.delete(userId);
+      return;
+    }
+
+    // 🗑️ Удаление отслеживаемого канала
+    if (state === 'waiting_for_monitored_channel_remove') {
+      await removeChannelWithDebug(ctx, text, 'monitored');
+      userStates.delete(userId);
+      return;
+    }
+
+  } catch (err) {
+    console.error('❌ Ошибка при обработке ввода:', err);
+    ctx.reply('⚠️ Произошла ошибка. Проверьте лог.');
   }
 });
 
-// === 🧩 ФУНКЦИЯ УДАЛЕНИЯ КАНАЛА ===
-async function removeChannelWithDebug(ctx, userText, type) {
-  const getChannelsFunc = type === 'target' ? db.getTargetChannels : db.getMonitoredChannels;
-  const removeChannelFunc = type === 'target' ? db.removeTargetChannel : db.removeMonitoredChannel;
 
-  const channels = await getChannelsFunc();
+// ==========================
+// 🧩 УДАЛЕНИЕ КАНАЛОВ
+// ==========================
+async function removeChannelWithDebug(ctx, userText, type) {
+  const isTarget = type === 'target';
+  const getFunc = isTarget ? db.getTargetChannels : db.getMonitoredChannels;
+  const removeFunc = isTarget ? db.removeTargetChannel : db.removeMonitoredChannel;
+  const menu = isTarget ? targetChannelsMenu : monitoredChannelsMenu;
+
+  const allChannels = await getFunc();
   const cleanInput = userText.replace('@', '').toLowerCase().trim();
 
-  const found = channels.find(ch => {
-    const id = ch.channel_id?.toString().toLowerCase() || '';
-    const username = ch.channel_username?.toLowerCase() || '';
-    const title = ch.channel_title?.toLowerCase() || '';
+  const found = allChannels.find(ch => {
+    const id = ch.channel_id?.toString().toLowerCase().trim() || '';
+    const username = ch.channel_username?.replace('@', '').toLowerCase().trim() || '';
+    const title = ch.channel_title?.toLowerCase().trim() || '';
     return (
       id.includes(cleanInput) ||
       username.includes(cleanInput) ||
@@ -201,22 +214,24 @@ async function removeChannelWithDebug(ctx, userText, type) {
   });
 
   if (!found) {
-    ctx.reply(`❌ Канал "${userText}" не найден.`);
+    ctx.reply(`❌ Канал "${userText}" не найден.`, menu);
     return;
   }
 
-  const removed = await removeChannelFunc(found.channel_id);
+  const removed = await removeFunc(found.channel_id);
   if (removed > 0) {
-    ctx.reply(`✅ Канал "${found.channel_title || found.channel_username || found.channel_id}" удалён.`);
+    ctx.reply(`✅ Канал "${found.channel_title || found.channel_username || found.channel_id}" удалён.`, menu);
   } else {
-    ctx.reply(`⚠️ Не удалось удалить канал "${userText}".`);
+    ctx.reply(`⚠️ Не удалось удалить канал "${userText}".`, menu);
   }
 }
 
-// === 🚀 ЗАПУСК ===
-(async () => {
-  await db.initializeDB();
-  console.log('✅ База данных готова.');
-  bot.launch();
-  console.log('🤖 Бот запущен.');
-})();
+
+// ==========================
+// 🚀 ЗАПУСК
+// ==========================
+bot.launch();
+log('✅ Бот запущен и готов к работе.');
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
