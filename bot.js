@@ -16,7 +16,7 @@ function log(msg) {
 }
 
 // Инициализация бота
-const bot = new Telegraf(config.BOT_TOKEN);
+const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 
 // Временное хранение состояния пользователя (например, ожидание ввода)
 const userStates = new Map();
