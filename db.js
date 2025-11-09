@@ -309,6 +309,27 @@ function setSetting(key, value) {
   });
 }
 
+// Подсчет пересланных сообщений
+function countForwardedMessages() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT COUNT(*) as count FROM forwarded_messages', (err, row) => {
+      if (err) reject(err);
+      else resolve(row.count);
+    });
+  });
+}
+
+// Подсчет отправленных новостей
+function countSentNews() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT COUNT(*) as count FROM sent_news', (err, row) => {
+      if (err) reject(err);
+      else resolve(row.count);
+    });
+  });
+}
+
+
 // 📤 ЭКСПОРТ ВСЕХ ФУНКЦИЙ ДЛЯ ИСПОЛЬЗОВАНИЯ В ДРУГИХ ФАЙЛАХ
 module.exports = {
   initializeDB,
@@ -332,5 +353,7 @@ module.exports = {
   isMessageForwarded,
   // Настройки
   getSetting,
-  setSetting
+  setSetting,
+  countForwardedMessages, // ✅ добавлено
+  countSentNews
 };
