@@ -58,23 +58,43 @@ class NewsService {
     await this.validateFeeds();
   }
 
-  async validateFeeds() {
-    log('🔍 Проверка доступности RSS-лент...');
-    let workingFeeds = 0;
-    
-    for (const feedUrl of config.RSS_FEEDS.slice(0, 3)) { // Проверяем только первые 3
-      try {
-        await this.parser.parseURL(feedUrl);
-        workingFeeds++;
-        log(`✅ RSS-лента доступна: ${feedUrl}`);
-      } catch (error) {
-        log(`⚠️ RSS-лента недоступна: ${feedUrl} - ${error.message}`);
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+async validateFeeds() {
+  log('🔍 Проверка доступности RSS-лент...');
+  let workingFeeds = 0;
+  let totalFeeds = config.RSS_FEEDS.length;
+  
+  // Проверяем ВСЕ RSS-ленты, но с ограничением времени
+  for (let i = 0; i < totalFeeds; i++) {
+    const feedUrl = config.RSS_FEEDS[i];
+    try {
+      // Ограничиваем время проверки 10 секундами на каждый фид
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Таймаут проверки')), 10000)
+      );
+      
+      const checkPromise = this.parser.parseURL(feedUrl);
+      await Promise.race([checkPromise, timeoutPromise]);
+      
+      workingFeeds++;
+      log(`✅ RSS-лента доступна: ${feedUrl} (${i + 1}/${totalFeeds})`);
+    } catch (error) {
+      log(`⚠️ RSS-лента недоступна: ${feedUrl} - ${error.message} (${i + 1}/${totalFeeds})`);
     }
     
-    log(`📊 Доступно RSS-лент: ${workingFeeds}/${Math.min(3, config.RSS_FEEDS.length)} (проверка первых 3)`);
+    // Небольшая задержка между проверками чтобы не перегружать сервера
+    if (i < totalFeeds - 1) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
   }
+  
+  log(`📊 Статистика RSS-лент: ${workingFeeds}/${totalFeeds} доступно`);
+  
+  if (workingFeeds === 0) {
+    log('❌ ВНИМАНИЕ: Ни одна RSS-лента не доступна! Проверьте настройки.');
+  } else if (workingFeeds < totalFeeds / 2) {
+    log('⚠️ ВНИМАНИЕ: Менее половины RSS-лент доступно!');
+  }
+}
 
   setSendFunction(sendFunction) {
     this.sendFunction = sendFunction;
