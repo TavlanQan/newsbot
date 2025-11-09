@@ -151,37 +151,19 @@ function addTargetChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить целевой канал - ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ
+// Удалить целевой канал
 function removeTargetChannel(channelId) {
   return new Promise((resolve, reject) => {
     console.log(`🗑️ SQLite: УДАЛЕНИЕ целевого канала ID: "${channelId}"`);
     
-    // Сначала проверим, существует ли канал
-    db.get('SELECT * FROM target_channels WHERE channel_id = ?', [channelId], (err, row) => {
+    db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
-        console.error('❌ Ошибка при проверке канала:', err);
+        console.error('❌ Ошибка при удалении целевого канала:', err);
         reject(err);
-        return;
+      } else {
+        console.log(`✅ Удалено целевых каналов: ${this.changes}`);
+        resolve(this.changes);
       }
-      
-      if (!row) {
-        console.log('❌ Канал не найден в базе');
-        resolve(0);
-        return;
-      }
-      
-      console.log(`📋 Найден канал для удаления: "${row.channel_title}" (ID: ${row.channel_id})`);
-      
-      // Теперь удаляем канал
-      db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
-        if (err) {
-          console.error('❌ Ошибка при удалении канала:', err);
-          reject(err);
-        } else {
-          console.log(`✅ Удалено целевых каналов: ${this.changes}`);
-          resolve(this.changes);
-        }
-      });
     });
   });
 }
@@ -212,37 +194,19 @@ function addMonitoredChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить отслеживаемый канал - ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ
+// Удалить отслеживаемый канал
 function removeMonitoredChannel(channelId) {
   return new Promise((resolve, reject) => {
     console.log(`🗑️ SQLite: УДАЛЕНИЕ отслеживаемого канала ID: "${channelId}"`);
     
-    // Сначала проверим, существует ли канал
-    db.get('SELECT * FROM monitored_channels WHERE channel_id = ?', [channelId], (err, row) => {
+    db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
-        console.error('❌ Ошибка при проверке канала:', err);
+        console.error('❌ Ошибка при удалении отслеживаемого канала:', err);
         reject(err);
-        return;
+      } else {
+        console.log(`✅ Удалено отслеживаемых каналов: ${this.changes}`);
+        resolve(this.changes);
       }
-      
-      if (!row) {
-        console.log('❌ Канал не найден в базе');
-        resolve(0);
-        return;
-      }
-      
-      console.log(`📋 Найден канал для удаления: "${row.channel_title}" (ID: ${row.channel_id})`);
-      
-      // Теперь удаляем канал
-      db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
-        if (err) {
-          console.error('❌ Ошибка при удалении канала:', err);
-          reject(err);
-        } else {
-          console.log(`✅ Удалено отслеживаемых каналов: ${this.changes}`);
-          resolve(this.changes);
-        }
-      });
     });
   });
 }
