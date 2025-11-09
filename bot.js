@@ -314,7 +314,7 @@ async function sendTopNews() {
   }
 }
 
-// 🛠️ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ КАНАЛА С ПРАВИЛЬНОЙ ПРОВЕРКОЙ
+// 🛠️ ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ КАНАЛА
 async function removeChannelWithDebug(ctx, userText, channelType) {
   console.log(`\n🔍 НАЧАЛО УДАЛЕНИЯ КАНАЛА ТИПА: ${channelType}`);
   console.log(`📝 ВВЕДЕННЫЙ ТЕКСТ: "${userText}"`);
@@ -345,7 +345,7 @@ async function removeChannelWithDebug(ctx, userText, channelType) {
     let channelInfo = '';
 
     // Случай 1: Пользователь ввел номер из списка
-    const channelNumber = parseInt(userText);
+    const channelNumber = parseInt(userText.trim());
     if (!isNaN(channelNumber) && channelNumber >= 1 && channelNumber <= channelsBefore.length) {
       console.log(`🔢 ПОЛЬЗОВАТЕЛЬ ВВЕЛ НОМЕР: ${channelNumber}`);
       const channelToRemove = channelsBefore[channelNumber - 1];
@@ -353,18 +353,20 @@ async function removeChannelWithDebug(ctx, userText, channelType) {
       channelInfo = `"${channelToRemove.channel_title || channelToRemove.channel_username || channelToRemove.channel_id}"`;
       console.log(`🎯 КАНАЛ ДЛЯ УДАЛЕНИЯ ПО НОМЕРУ: ${channelInfo} (ID: ${channelIdToRemove})`);
     }
-    // Случай 2: Прямой ID канала
-    else if (!channelIdToRemove) {
+    
+    // Случай 2: Прямой ID канала (если не нашли по номеру)
+    if (!channelIdToRemove) {
       console.log(`🔍 ПРОБУЕМ НАЙТИ ПО ПРЯМОМУ ID: "${userText}"`);
-      const channelById = channelsBefore.find(ch => ch.channel_id === userText);
+      const channelById = channelsBefore.find(ch => ch.channel_id === userText.trim());
       if (channelById) {
         channelIdToRemove = channelById.channel_id;
         channelInfo = `"${channelById.channel_title || channelById.channel_username || channelById.channel_id}"`;
         console.log(`🎯 НАЙДЕН КАНАЛ ПО ID: ${channelInfo}`);
       }
     }
-    // Случай 3: Поиск по username или названию
-    else if (!channelIdToRemove) {
+    
+    // Случай 3: Поиск по username или названию (если не нашли по ID)
+    if (!channelIdToRemove) {
       console.log(`🔍 ПРОБУЕМ НАЙТИ КАНАЛ ПО USERNAME/НАЗВАНИЮ: "${userText}"`);
       
       const cleanUserInput = userText.replace('@', '').toLowerCase().trim();
@@ -374,9 +376,10 @@ async function removeChannelWithDebug(ctx, userText, channelType) {
         const cleanTitle = ch.channel_title ? ch.channel_title.toLowerCase().trim() : '';
         
         return (
-          ch.channel_id === userText ||
           cleanUsername === cleanUserInput ||
-          cleanTitle === cleanUserInput
+          cleanTitle === cleanUserInput ||
+          (ch.channel_title && ch.channel_title.toLowerCase().includes(cleanUserInput)) ||
+          (ch.channel_username && ch.channel_username.toLowerCase().includes(cleanUserInput.replace('@', '')))
         );
       });
 
@@ -455,7 +458,7 @@ bot.command('start', (ctx) => {
 📰 **Поиск новостей:**
 • На всех языках мира
 • Из NewsAPI и RSS-лент
-• По вашим ключевым словам
+• По вашим ключевыми словами
 
 🔍 **Мониторинг каналов:**
 • Отслеживание Telegram-каналов

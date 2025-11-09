@@ -151,12 +151,18 @@ function addTargetChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить целевой канал
+// Удалить целевой канал - ИСПРАВЛЕННАЯ ВЕРСИЯ
 function removeTargetChannel(channelId) {
   return new Promise((resolve, reject) => {
+    console.log(`🗑️ SQLite: УДАЛЕНИЕ целевого канала ID: ${channelId}`);
     db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
-      if (err) reject(err);
-      else resolve(this.changes);
+      if (err) {
+        console.error(`❌ SQLite ОШИБКА удаления целевого канала:`, err);
+        reject(err);
+      } else {
+        console.log(`✅ SQLite: Удалено целевых каналов: ${this.changes}`);
+        resolve(this.changes);
+      }
     });
   });
 }
@@ -187,12 +193,18 @@ function addMonitoredChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить отслеживаемый канал
+// Удалить отслеживаемый канал - ИСПРАВЛЕННАЯ ВЕРСИЯ
 function removeMonitoredChannel(channelId) {
   return new Promise((resolve, reject) => {
+    console.log(`🗑️ SQLite: УДАЛЕНИЕ отслеживаемого канала ID: ${channelId}`);
     db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
-      if (err) reject(err);
-      else resolve(this.changes);
+      if (err) {
+        console.error(`❌ SQLite ОШИБКА удаления отслеживаемого канала:`, err);
+        reject(err);
+      } else {
+        console.log(`✅ SQLite: Удалено отслеживаемых каналов: ${this.changes}`);
+        resolve(this.changes);
+      }
     });
   });
 }
