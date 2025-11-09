@@ -5,16 +5,39 @@ const newsService = require('./newsService');
 const fs = require('fs');
 const path = require('path');
 
-const logStream = fs.createWriteStream(path.join(__dirname, 'bot.log'), { flags: 'a' });
+// Улучшенная система логирования с управлением потоком
+let logStream;
+
+function createLogStream() {
+  if (logStream) {
+    try {
+      logStream.end(); // Аккуратно закрываем предыдущий поток
+    } catch (e) {
+      console.error('Ошибка закрытия logStream:', e.message);
+    }
+  }
+  logStream = fs.createWriteStream(path.join(__dirname, 'bot.log'), { flags: 'a' });
+  return logStream;
+}
+
 function log(msg) {
   const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
   const logMsg = `[${timestamp}] ${msg}\n`;
-  logStream.write(logMsg);
-  console.log(logMsg);
+  
+  if (!logStream || logStream.destroyed) {
+    logStream = createLogStream();
+  }
+  
+  try {
+    logStream.write(logMsg);
+    console.log(logMsg);
+  } catch (error) {
+    console.error('Ошибка записи в лог:', error.message);
+  }
 }
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
-const userStates = new Map();
+const userStates = new Map(); // Добавляем timestamp для состояний
 
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
@@ -113,11 +136,29 @@ async function forwardMessageFromChannel(channelId, messageId) {
 
 async function addChannelSimple(channelIdentifier, channelType) {
   try {
+    // Валидация ID канала
+    if (!channelIdentifier || typeof channelIdentifier !== 'string') {
+      return {
+        success: false,
+        message: '❌ Неверный формат ID канала'
+      };
+    }
+
+    // Проверка формата ID канала (Telegram channel IDs обычно начинаются с -100)
+    if (channelIdentifier.startsWith('-') && !channelIdentifier.startsWith('-100')) {
+      return {
+        success: false,
+        message: '❌ Неверный формат ID канала. Должен начинаться с -100 для супергрупп'
+      };
+    }
+
     let result;
+    const channelTitle = channelType === 'target' ? `Канал ${channelIdentifier}` : `Мониторинг ${channelIdentifier}`;
+    
     if (channelType === 'target') {
-      result = await db.addTargetChannel(channelIdentifier, channelIdentifier, channelIdentifier);
+      result = await db.addTargetChannel(channelIdentifier, null, channelTitle);
     } else {
-      result = await db.addMonitoredChannel(channelIdentifier, channelIdentifier, channelIdentifier);
+      result = await db.addMonitoredChannel(channelIdentifier, null, channelTitle);
     }
     
     return {
@@ -183,6 +224,38 @@ async function removeChannelSimple(ctx, userText, type) {
   }
 }
 
+// Функция для безопасного завершения работы
+async function shutdown() {
+  log('🔴 Завершение работы бота...');
+  try {
+    if (logStream) {
+      logStream.end();
+    }
+    await bot.stop();
+    process.exit(0);
+  } catch (error) {
+    console.error('Ошибка при завершении:', error);
+    process.exit(1);
+  }
+}
+
+// Таймаут для состояний пользователя (очистка каждые 5 минут)
+setInterval(() => {
+  const now = Date.now();
+  let clearedCount = 0;
+  
+  for (const [userId, stateData] of userStates.entries()) {
+    if (now - stateData.timestamp > 30 * 60 * 1000) { // 30 минут
+      userStates.delete(userId);
+      clearedCount++;
+    }
+  }
+  
+  if (clearedCount > 0) {
+    log(`🧹 Очищено ${clearedCount} устаревших состояний пользователей`);
+  }
+}, 5 * 60 * 1000); // Проверка каждые 5 минут
+
 bot.start(async (ctx) => {
   try {
     await db.initializeDB();
@@ -222,12 +295,18 @@ bot.hears('🗝️ Ключевые слова', async (ctx) => {
 });
 
 bot.hears('➕ Добавить ключевое слово', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_keyword_add');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_keyword_add', 
+    timestamp: Date.now() 
+  });
   ctx.reply('✏️ Введите ключевое слово для добавления:');
 });
 
 bot.hears('🗑️ Удалить ключевое слово', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_keyword_remove');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_keyword_remove', 
+    timestamp: Date.now() 
+  });
   ctx.reply('🗑️ Введите ключевое слово для удаления:');
 });
 
@@ -244,12 +323,18 @@ bot.hears('🎯 Целевые каналы', async (ctx) => {
 });
 
 bot.hears('➕ Добавить целевой канал', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_target_channel_add');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_target_channel_add', 
+    timestamp: Date.now() 
+  });
   ctx.reply('✏️ Введите ID целевого канала (например: -1001234567890):');
 });
 
 bot.hears('🗑️ Удалить целевой канал', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_target_channel_remove');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_target_channel_remove', 
+    timestamp: Date.now() 
+  });
   ctx.reply('🗑️ Введите ID целевого канала для удаления:');
 });
 
@@ -266,12 +351,18 @@ bot.hears('📡 Мониторинг каналов', async (ctx) => {
 });
 
 bot.hears('➕ Добавить отслеживаемый канал', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_monitored_channel_add');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_monitored_channel_add', 
+    timestamp: Date.now() 
+  });
   ctx.reply('✏️ Введите ID канала для отслеживания (например: -1001234567890):');
 });
 
 bot.hears('🗑️ Удалить отслеживаемый канал', (ctx) => {
-  userStates.set(ctx.from.id, 'waiting_for_monitored_channel_remove');
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_monitored_channel_remove', 
+    timestamp: Date.now() 
+  });
   ctx.reply('🗑️ Введите ID отслеживаемого канала для удаления:');
 });
 
@@ -327,7 +418,8 @@ bot.on('channel_post', async (ctx) => {
 
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
-  const state = userStates.get(userId);
+  const stateData = userStates.get(userId);
+  const state = stateData ? stateData.state : null;
   const text = ctx.message.text?.trim();
   
   if (!text || (ctx.message.chat && ctx.message.chat.type === 'channel')) return;
@@ -385,14 +477,32 @@ bot.on('message', async (ctx) => {
 
   } catch (err) {
     console.error('❌ Ошибка при обработке ввода:', err);
-    ctx.reply('⚠️ Произошла ошибка. Проверьте лог.');
+    // ОЧИСТКА СОСТОЯНИЯ ПРИ ОШИБКЕ
+    userStates.delete(userId);
+    ctx.reply('❌ Произошла ошибка. Ваше состояние сброшено. Пожалуйста, попробуйте снова.', mainMenu);
   }
 });
 
 async function startBot() {
   try {
     log('🚀 Запуск бота...');
-    await db.initializeDB();
+    
+    // Инициализация БД с повторными попытками
+    let dbInitialized = false;
+    let attempts = 0;
+    while (!dbInitialized && attempts < 3) {
+      try {
+        await db.initializeDB();
+        dbInitialized = true;
+        log('✅ База данных инициализирована');
+      } catch (dbError) {
+        attempts++;
+        log(`❌ Попытка ${attempts}/3 инициализации БД не удалась: ${dbError.message}`);
+        if (attempts === 3) throw dbError;
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+
     await newsService.initialize();
     await bot.launch();
     log('✅ Бот запущен и готов к работе.');
@@ -400,7 +510,8 @@ async function startBot() {
     log('✅ Функция отправки установлена');
   } catch (error) {
     log(`❌ Критическая ошибка запуска бота: ${error.message}`);
-    process.exit(1);
+    // Даем время записать логи перед выходом
+    setTimeout(() => process.exit(1), 1000);
   }
 }
 
@@ -417,12 +528,10 @@ startBot();
 
 process.once('SIGINT', () => {
   log('⏹️ Остановка бота по SIGINT');
-  bot.stop('SIGINT');
-  process.exit(0);
+  shutdown();
 });
 
 process.once('SIGTERM', () => {
   log('⏹️ Остановка бота по SIGTERM');
-  bot.stop('SIGTERM');
-  process.exit(0);
+  shutdown();
 });
