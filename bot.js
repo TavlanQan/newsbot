@@ -138,12 +138,6 @@ bot.hears('📈 Статистика', async (ctx) => {
     `;
     ctx.reply(msg, mainMenu);
 
-  } catch (err) {
-    console.error('❌ Ошибка при получении статистики:', err);
-    ctx.reply('⚠️ Не удалось получить статистику.');
-  }
-});
-
 
     // Отправляем статистику
     const msg = `
