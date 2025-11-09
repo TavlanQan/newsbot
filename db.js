@@ -151,18 +151,37 @@ function addTargetChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить целевой канал - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// Удалить целевой канал - ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ
 function removeTargetChannel(channelId) {
   return new Promise((resolve, reject) => {
-    console.log(`🗑️ SQLite: УДАЛЕНИЕ целевого канала ID: ${channelId}`);
-    db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
+    console.log(`🗑️ SQLite: УДАЛЕНИЕ целевого канала ID: "${channelId}"`);
+    
+    // Сначала проверим, существует ли канал
+    db.get('SELECT * FROM target_channels WHERE channel_id = ?', [channelId], (err, row) => {
       if (err) {
-        console.error(`❌ SQLite ОШИБКА удаления целевого канала:`, err);
+        console.error('❌ Ошибка при проверке канала:', err);
         reject(err);
-      } else {
-        console.log(`✅ SQLite: Удалено целевых каналов: ${this.changes}`);
-        resolve(this.changes);
+        return;
       }
+      
+      if (!row) {
+        console.log('❌ Канал не найден в базе');
+        resolve(0);
+        return;
+      }
+      
+      console.log(`📋 Найден канал для удаления: "${row.channel_title}" (ID: ${row.channel_id})`);
+      
+      // Теперь удаляем канал
+      db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
+        if (err) {
+          console.error('❌ Ошибка при удалении канала:', err);
+          reject(err);
+        } else {
+          console.log(`✅ Удалено целевых каналов: ${this.changes}`);
+          resolve(this.changes);
+        }
+      });
     });
   });
 }
@@ -170,7 +189,7 @@ function removeTargetChannel(channelId) {
 // Получить все целевые каналы
 function getTargetChannels() {
   return new Promise((resolve, reject) => {
-    db.all('SELECT channel_id, channel_username, channel_title FROM target_channels', (err, rows) => {
+    db.all('SELECT channel_id, channel_username, channel_title FROM target_channels ORDER BY channel_title', (err, rows) => {
       if (err) reject(err);
       else resolve(rows);
     });
@@ -193,18 +212,37 @@ function addMonitoredChannel(channelId, username = null, title = null) {
   });
 }
 
-// Удалить отслеживаемый канал - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// Удалить отслеживаемый канал - ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ
 function removeMonitoredChannel(channelId) {
   return new Promise((resolve, reject) => {
-    console.log(`🗑️ SQLite: УДАЛЕНИЕ отслеживаемого канала ID: ${channelId}`);
-    db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
+    console.log(`🗑️ SQLite: УДАЛЕНИЕ отслеживаемого канала ID: "${channelId}"`);
+    
+    // Сначала проверим, существует ли канал
+    db.get('SELECT * FROM monitored_channels WHERE channel_id = ?', [channelId], (err, row) => {
       if (err) {
-        console.error(`❌ SQLite ОШИБКА удаления отслеживаемого канала:`, err);
+        console.error('❌ Ошибка при проверке канала:', err);
         reject(err);
-      } else {
-        console.log(`✅ SQLite: Удалено отслеживаемых каналов: ${this.changes}`);
-        resolve(this.changes);
+        return;
       }
+      
+      if (!row) {
+        console.log('❌ Канал не найден в базе');
+        resolve(0);
+        return;
+      }
+      
+      console.log(`📋 Найден канал для удаления: "${row.channel_title}" (ID: ${row.channel_id})`);
+      
+      // Теперь удаляем канал
+      db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
+        if (err) {
+          console.error('❌ Ошибка при удалении канала:', err);
+          reject(err);
+        } else {
+          console.log(`✅ Удалено отслеживаемых каналов: ${this.changes}`);
+          resolve(this.changes);
+        }
+      });
     });
   });
 }
@@ -212,7 +250,7 @@ function removeMonitoredChannel(channelId) {
 // Получить все отслеживаемые каналы
 function getMonitoredChannels() {
   return new Promise((resolve, reject) => {
-    db.all('SELECT channel_id, channel_username, channel_title FROM monitored_channels', (err, rows) => {
+    db.all('SELECT channel_id, channel_username, channel_title FROM monitored_channels ORDER BY channel_title', (err, rows) => {
       if (err) reject(err);
       else resolve(rows);
     });
