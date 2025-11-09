@@ -4,6 +4,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const db = require('./db');
 const config = require('./config');
+const newsService = require('./newsService');
 const fs = require('fs');
 const path = require('path');
 
@@ -11,8 +12,9 @@ const path = require('path');
 const logStream = fs.createWriteStream(path.join(__dirname, 'bot.log'), { flags: 'a' });
 function log(msg) {
   const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
-  logStream.write(`[${timestamp}] ${msg}\n`);
-  console.log(msg);
+  const logMsg = `[${timestamp}] ${msg}\n`;
+  logStream.write(logMsg);
+  console.log(logMsg);
 }
 
 // Инициализация бота
@@ -25,6 +27,7 @@ const userStates = new Map();
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
   ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
+  ['🔄 Запустить пересылку', '⏹️ Остановить пересылку']
 ]).resize();
 
 // Меню ключевых слов
@@ -45,6 +48,74 @@ const monitoredChannelsMenu = Markup.keyboard([
   ['⬅️ Назад']
 ]).resize();
 
+// Флаг активности пересылки
+let isForwardingActive = false;
+
+// ==========================
+// 🔄 ФУНКЦИИ ПЕРЕСЫЛКИ СООБЩЕНИЙ
+// ==========================
+
+// Функция для пересылки сообщений из отслеживаемых каналов
+async function forwardMessageFromChannel(ctx, channelId, messageId) {
+  try {
+    const targetChannels = await db.getTargetChannels();
+    const isAlreadyForwarded = await db.isMessageForwarded(messageId, channelId);
+    
+    if (isAlreadyForwarded) {
+      log(`⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано`);
+      return;
+    }
+
+    for (const targetChannel of targetChannels) {
+      try {
+        await ctx.telegram.forwardMessage(
+          targetChannel.channel_id,
+          channelId,
+          messageId
+        );
+        log(`✅ Переслано сообщение ${messageId} в канал ${targetChannel.channel_id}`);
+        
+        // Добавляем запись о пересылке
+        await db.addForwardedMessage(messageId, channelId);
+        
+        // Задержка между отправками чтобы избежать лимитов
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        log(`❌ Ошибка пересылки в канал ${targetChannel.channel_id}: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    log(`❌ Ошибка в forwardMessageFromChannel: ${error.message}`);
+  }
+}
+
+// Функция для проверки и пересылки новых сообщений
+async function checkAndForwardMessages() {
+  if (!isForwardingActive) return;
+
+  try {
+    log('🔄 Проверка новых сообщений в отслеживаемых каналах...');
+    
+    const monitoredChannels = await db.getMonitoredChannels();
+    const keywords = await db.getKeywords();
+    
+    for (const channel of monitoredChannels) {
+      try {
+        // Получаем последние сообщения из канала
+        // Note: В реальном приложении нужно использовать Telegram API для получения сообщений
+        // Это упрощенная реализация для демонстрации
+        log(`🔍 Проверка канала: ${channel.channel_title || channel.channel_id}`);
+      } catch (error) {
+        log(`❌ Ошибка при проверке канала ${channel.channel_id}: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    log(`❌ Ошибка в checkAndForwardMessages: ${error.message}`);
+  }
+}
+
+// Запуск периодической проверки
+setInterval(checkAndForwardMessages, 60000); // Проверка каждую минуту
 
 // ==========================
 // ⚙️ ОБРАБОТЧИКИ КОМАНД
@@ -52,11 +123,28 @@ const monitoredChannelsMenu = Markup.keyboard([
 
 bot.start(async (ctx) => {
   await db.initializeDB();
+  await newsService.initialize();
   ctx.reply('👋 Привет! Я бот для мониторинга и пересылки новостей.', mainMenu);
 });
 
 // Главное меню
 bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
+
+// Запуск пересылки
+bot.hears('🔄 Запустить пересылку', async (ctx) => {
+  isForwardingActive = true;
+  await newsService.startMonitoring();
+  ctx.reply('✅ Пересылка сообщений активирована!', mainMenu);
+  log('🔄 Пересылка сообщений активирована пользователем');
+});
+
+// Остановка пересылки
+bot.hears('⏹️ Остановить пересылку', async (ctx) => {
+  isForwardingActive = false;
+  await newsService.stopMonitoring();
+  ctx.reply('⏹️ Пересылка сообщений остановлена!', mainMenu);
+  log('⏹️ Пересылка сообщений остановлена пользователем');
+});
 
 // Меню ключевых слов
 bot.hears('🗝️ Ключевые слова', async (ctx) => {
@@ -135,9 +223,9 @@ bot.hears('📈 Статистика', async (ctx) => {
 📡 Отслеживаемых каналов: ${monitoredChannelsCount}
 📤 Пересланных сообщений: ${forwardedCount}
 📰 Отправленных новостей: ${sentNewsCount}
+🔄 Пересылка: ${isForwardingActive ? '✅ Активна' : '❌ Остановлена'}
     `;
     ctx.reply(msg, mainMenu);
-
 
   } catch (err) {
     console.error('❌ Ошибка при получении статистики:', err);
@@ -145,6 +233,31 @@ bot.hears('📈 Статистика', async (ctx) => {
   }
 });
 
+// Обработчик новых сообщений в каналах
+bot.on('channel_post', async (ctx) => {
+  if (!isForwardingActive) return;
+
+  try {
+    const channelPost = ctx.channelPost;
+    if (!channelPost) return;
+
+    const channelId = channelPost.chat.id.toString();
+    const messageId = channelPost.message_id;
+
+    // Проверяем, отслеживается ли этот канал
+    const monitoredChannels = await db.getMonitoredChannels();
+    const isMonitored = monitoredChannels.some(ch => 
+      ch.channel_id === channelId || 
+      ch.channel_username === channelPost.chat.username
+    );
+
+    if (isMonitored) {
+      await forwardMessageFromChannel(ctx, channelId, messageId);
+    }
+  } catch (error) {
+    log(`❌ Ошибка обработки channel_post: ${error.message}`);
+  }
+});
 
 // ==========================
 // 🧠 ОБРАБОТКА ВВОДА ПОЛЬЗОВАТЕЛЯ
@@ -215,7 +328,6 @@ bot.on('message', async (ctx) => {
   }
 });
 
-
 // ==========================
 // 🧩 УДАЛЕНИЕ КАНАЛОВ
 // ==========================
@@ -253,85 +365,21 @@ async function removeChannelWithDebug(ctx, userText, type) {
 }
 
 // ==========================
-// 🔄 ПЕРЕСЫЛКА СООБЩЕНИЙ ИЗ ОТСЛЕЖИВАЕМЫХ КАНАЛОВ
-// ==========================
-
-// Обработчик новых сообщений в отслеживаемых каналах
-bot.on('channel_post', async (ctx) => {
-  try {
-    const message = ctx.update.channel_post;
-    const chatId = String(message.chat.id);
-    
-    // Проверяем, что сообщение из отслеживаемого канала
-    const monitoredChannels = await db.getMonitoredChannels();
-    const isMonitored = monitoredChannels.some(ch => ch.channel_id === chatId);
-    
-    if (!isMonitored) return;
-
-    // Проверяем, не пересылали ли уже это сообщение
-    const isForwarded = await db.isMessageForwarded(message.message_id, chatId);
-    if (isForwarded) {
-      console.log(`Сообщение ${message.message_id} из канала ${chatId} уже переслано.`);
-      return;
-    }
-
-    // Получаем целевые каналы
-    const targetChannels = await db.getTargetChannels();
-    if (targetChannels.length === 0) {
-      console.log('Нет целевых каналов для пересылки.');
-      return;
-    }
-
-    // Получаем ключевые слова для фильтрации
-    const keywords = await db.getKeywords();
-    
-    // Проверяем текст сообщения на ключевые слова
-    const messageText = message.text || message.caption || '';
-    const hasKeyword = keywords.length === 0 || 
-                      keywords.some(keyword => 
-                        messageText.toLowerCase().includes(keyword.toLowerCase())
-                      );
-
-    if (!hasKeyword && keywords.length > 0) {
-      console.log(`Сообщение не содержит ключевых слов: "${messageText.substring(0, 50)}..."`);
-      return;
-    }
-
-    // Пересылаем сообщение в каждый целевой канал
-    for (const targetChannel of targetChannels) {
-      try {
-        await ctx.telegram.forwardMessage(
-          targetChannel.channel_id,
-          chatId,
-          message.message_id
-        );
-        
-        // Записываем в базу факт пересылки
-        await db.addForwardedMessage(message.message_id, chatId);
-        
-        console.log(`✅ Переслано сообщение ${message.message_id} из ${chatId} в ${targetChannel.channel_id}`);
-        
-      } catch (err) {
-        console.error(`❌ Ошибка при пересылке в канал ${targetChannel.channel_id}:`, err);
-      }
-    }
-
-  } catch (err) {
-    console.error('❌ Ошибка в обработчике channel_post:', err);
-  }
-});
-
-// Также обрабатываем обычные сообщения (если нужно)
-bot.on('message', async (ctx) => {
-  // Эта функция уже есть, но добавьте проверку на пересылку здесь тоже,
-  // если хотите пересылать сообщения из групп, а не только каналов
-});
-
-// ==========================
 // 🚀 ЗАПУСК
 // ==========================
-bot.launch();
-log('✅ Бот запущен и готов к работе.');
+async function startBot() {
+  try {
+    await db.initializeDB();
+    await newsService.initialize();
+    bot.launch();
+    log('✅ Бот запущен и готов к работе.');
+    log('🔄 Для начала пересылки используйте команду "Запустить пересылку"');
+  } catch (error) {
+    log(`❌ Ошибка запуска бота: ${error.message}`);
+  }
+}
+
+startBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

@@ -1,7 +1,7 @@
 {
-  "name": "telegram-news-bot",
+  "name": "newsbot",
   "version": "1.0.0",
-  "description": "Telegram bot for automatic news posting and channel monitoring",
+  "description": "Telegram bot for news monitoring and forwarding",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -9,12 +9,12 @@
   },
   "dependencies": {
     "telegraf": "^4.16.3",
-    "axios": "^1.7.2",
     "sqlite3": "^5.1.6",
+    "rss-parser": "^3.13.0",
     "node-cron": "^3.0.3",
-    "rss-parser": "^3.13.0"
+    "axios": "^1.6.2"
   },
-  "engines": {
-    "node": ">=18.0.0"
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   }
 }
