@@ -139,18 +139,6 @@ bot.hears('📈 Статистика', async (ctx) => {
     ctx.reply(msg, mainMenu);
 
 
-    // Отправляем статистику
-    const msg = `
-📊 Статистика бота:
-
-🗝️ Ключевых слов: ${keywordsCount}
-🎯 Целевых каналов: ${targetChannelsCount}
-📡 Отслеживаемых каналов: ${monitoredChannelsCount}
-📤 Пересланных сообщений: ${forwardedCount}
-📰 Отправленных новостей: ${sentNewsCount}
-    `;
-    ctx.reply(msg, mainMenu);
-
   } catch (err) {
     console.error('❌ Ошибка при получении статистики:', err);
     ctx.reply('⚠️ Не удалось получить статистику.');
