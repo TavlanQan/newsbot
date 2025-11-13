@@ -14,7 +14,6 @@ module.exports = {
   
   // Настройки RSS
   RSS_FEEDS: [
-    'https://lenta.ru/rss/news',
     'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
     'https://www.theverge.com/rss/index.xml',
     'https://www.vox.com/rss/index.xml',
