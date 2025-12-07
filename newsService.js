@@ -50,6 +50,22 @@ class NewsService {
     this.isMonitoring = false;
     this.sendFunction = null;
     this.currentProcessing = null; // Для отслеживания текущей обработки
+    this.keywordsCache = []; // Кэш ключевых слов
+    this.lastKeywordsUpdate = 0; // Когда обновляли
+    this.CACHE_TIME = 5 * 60 * 1000; // 5 минут в миллисекундах
+  }
+
+  async getKeywordsCached() {
+    const now = Date.now();
+    
+    // Если кэш устарел (прошло больше 5 минут) или пустой
+    if (now - this.lastKeywordsUpdate > this.CACHE_TIME || this.keywordsCache.length === 0) {
+      log('🔄 Обновляю кэш ключевых слов');
+      this.keywordsCache = await db.getKeywords();
+      this.lastKeywordsUpdate = now;
+    }
+    
+    return this.keywordsCache;
   }
 
   async initialize() {
@@ -172,21 +188,23 @@ async validateFeeds() {
     let processedFeeds = 0;
     let errorFeeds = 0;
     
-    for (const feedUrl of config.RSS_FEEDS) {
-      try {
-        await this.processFeed(feedUrl);
-        processedFeeds++;
-        
-        // Задержка между обработкой фидов чтобы избежать блокировок
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } catch (error) {
-        errorFeeds++;
-        log(`❌ Ошибка обработки RSS-ленты ${feedUrl}: ${error.message}`);
-        
-        // Более короткая задержка при ошибке
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+for (let i = 0; i < config.RSS_FEEDS.length; i++) {
+  const feedUrl = config.RSS_FEEDS[i];
+  try {
+    await this.processFeed(feedUrl);
+    processedFeeds++;
+    
+    // УМНАЯ ЗАДЕРЖКА: первые 5 лент быстро, остальные медленнее
+    const delay = i < 5 ? 500 : 1000; // 0.5 секунды для первых 5, 1 секунда для остальных
+    await new Promise(resolve => setTimeout(resolve, delay));
+  } catch (error) {
+    errorFeeds++;
+    log(`❌ Ошибка обработки RSS-ленты ${feedUrl}: ${error.message}`);
+    
+    // При ошибке ждем меньше
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+}
     
     log(`✅ Проверка RSS завершена. Успешно: ${processedFeeds}, с ошибками: ${errorFeeds}`);
   }
@@ -204,8 +222,16 @@ async validateFeeds() {
       const keywords = await db.getKeywords();
       
       // Обрабатываем только последние 5 новостей чтобы не перегружать
-      const recentItems = feed.items.slice(0, 5);
-      let processedItems = 0;
+const keywords = await db.getKeywords();
+
+// Обрабатываем только последние 10 новостей чтобы не перегружать
+const MAX_ITEMS_PER_FEED = 10;
+const recentItems = feed.items.slice(0, MAX_ITEMS_PER_FEED);
+
+// Добавляем предупреждение если новостей слишком много
+if (feed.items && feed.items.length > 50) {
+  log(`⚠️ ВНИМАНИЕ: ${feedUrl} вернул ${feed.items.length} новостей! Обрабатываю только ${MAX_ITEMS_PER_FEED}`);
+}
       
       for (const item of recentItems) {
         try {
@@ -279,45 +305,67 @@ async validateFeeds() {
     }
   }
 
-  formatNewsMessage(item, feedTitle) {
-    const title = item.title || 'Без названия';
-    let content = item.contentSnippet || item.description || item.content || '';
-    
-    // Очистка HTML тегов
-    content = content.replace(/<[^>]*>/g, '').trim();
-    
-    // Обрезка длинного контента
-    if (content.length > 300) {
-      content = content.substring(0, 300) + '...';
-    }
-    
-    // Если контент пустой, используем заголовок как контент
-    if (!content) {
-      content = title;
-    }
-    
-    const link = item.link || '';
-    const source = feedTitle || 'Неизвестный источник';
-    
-    return `
-📰 <b>${this.escapeHtml(title)}</b>
-
-${this.escapeHtml(content)}
-
-${link ? `🔗 <a href="${link}">Читать полностью</a>` : ''}
-📋 Источник: ${this.escapeHtml(source)}
-    `.trim();
+formatNewsMessage(item, feedTitle) {
+  const title = item.title || 'Без названия';
+  let content = item.contentSnippet || item.description || item.content || '';
+  
+  // 1. Удаляем ВСЕ HTML теги
+  content = content.replace(/<[^>]*>/g, '').trim();
+  
+  // 2. Обрезаем слишком длинный контент (увеличиваем лимит)
+  const MAX_CONTENT_LENGTH = 500;
+  if (content.length > MAX_CONTENT_LENGTH) {
+    content = content.substring(0, MAX_CONTENT_LENGTH) + '...';
   }
-
-  escapeHtml(text) {
-    if (!text) return '';
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
+  
+  // 3. Если контент пустой, используем заголовок
+  if (!content) {
+    content = title;
   }
+  
+  const link = item.link || '';
+  const source = feedTitle || 'Неизвестный источник';
+  
+  // 4. Экранируем ВЕСЬ текст для безопасности
+  const safeTitle = this.escapeHtml(title);
+  const safeContent = this.escapeHtml(content);
+  const safeSource = this.escapeHtml(source);
+  
+  // 5. Формируем ссылку безопасно
+  let safeLink = '';
+  if (link) {
+    // Простая проверка что ссылка начинается с http
+    if (link.startsWith('http://') || link.startsWith('https://')) {
+      safeLink = `🔗 <a href="${link}">Читать полностью</a>`;
+    } else {
+      // Если ссылка странная, показываем как текст
+      safeLink = `🔗 Ссылка: ${this.escapeHtml(link)}`;
+    }
+  }
+  
+  // 6. Формируем финальное сообщение
+  return `
+📰 <b>${safeTitle}</b>
+
+${safeContent}
+
+${safeLink}
+📋 Источник: ${safeSource}
+  `.trim();
+}
+
+escapeHtml(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+    .replace(/\$/g, '&#36;')     // знак доллара
+    .replace(/`/g, '&#96;')      // обратная кавычка
+    .replace(/\|/g, '&#124;');   // вертикальная черта
+}
 
   // Метод для ручной проверки (может быть полезен для отладки)
   async manualCheck() {

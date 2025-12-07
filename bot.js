@@ -81,7 +81,7 @@ async function sendMessageToTargetChannels(message, options = {}) {
         });
         log(`✅ Отправлено сообщение в канал ${targetChannel.channel_id}`);
         successCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 300));
       } catch (error) {
         log(`❌ Ошибка отправки в канал ${targetChannel.channel_id}: ${error.message}`);
       }
@@ -119,7 +119,7 @@ async function forwardMessageFromChannel(channelId, messageId) {
         );
         log(`✅ Переслано сообщение ${messageId} в канал ${targetChannel.channel_id}`);
         successCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 300));
       } catch (error) {
         log(`❌ Ошибка пересылки в канал ${targetChannel.channel_id}: ${error.message}`);
       }
