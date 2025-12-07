@@ -219,7 +219,7 @@ for (let i = 0; i < config.RSS_FEEDS.length; i++) {
         return;
       }
 
-      const keywords = await db.getKeywords();
+      const keywords = await this.getKeywordsCached();
       
       // Обрабатываем только последние 5 новостей чтобы не перегружать
 const keywords = await db.getKeywords();
@@ -277,6 +277,15 @@ if (feed.items && feed.items.length > 50) {
 
   async processNewsItem(item, feedTitle) {
     const newsId = item.guid || item.link;
+
+async processNewsItem(item, feedTitle) {
+  const newsId = item.guid || item.link;
+  
+  // Проверяем размер новости
+  if (item.content && item.content.length > 10000) {
+    log(`📏 Новость слишком большая (${item.content.length} символов), обрезаю`);
+    item.content = item.content.substring(0, 10000) + '...';
+  }
     
     try {
       // Двойная проверка перед отправкой
