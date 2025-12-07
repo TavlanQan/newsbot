@@ -188,23 +188,23 @@ async validateFeeds() {
     let processedFeeds = 0;
     let errorFeeds = 0;
     
-for (let i = 0; i < config.RSS_FEEDS.length; i++) {
-  const feedUrl = config.RSS_FEEDS[i];
-  try {
-    await this.processFeed(feedUrl);
-    processedFeeds++;
-    
-    // УМНАЯ ЗАДЕРЖКА: первые 5 лент быстро, остальные медленнее
-    const delay = i < 5 ? 500 : 1000; // 0.5 секунды для первых 5, 1 секунда для остальных
-    await new Promise(resolve => setTimeout(resolve, delay));
-  } catch (error) {
-    errorFeeds++;
-    log(`❌ Ошибка обработки RSS-ленты ${feedUrl}: ${error.message}`);
-    
-    // При ошибке ждем меньше
-    await new Promise(resolve => setTimeout(resolve, 300));
-  }
-}
+    for (let i = 0; i < config.RSS_FEEDS.length; i++) {
+      const feedUrl = config.RSS_FEEDS[i];
+      try {
+        await this.processFeed(feedUrl);
+        processedFeeds++;
+        
+        // УМНАЯ ЗАДЕРЖКА: первые 5 лент быстро, остальные медленнее
+        const delay = i < 5 ? 500 : 1000; // 0.5 секунды для первых 5, 1 секунда для остальных
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } catch (error) {
+        errorFeeds++;
+        log(`❌ Ошибка обработки RSS-ленты ${feedUrl}: ${error.message}`);
+        
+        // При ошибке ждем меньше
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
     
     log(`✅ Проверка RSS завершена. Успешно: ${processedFeeds}, с ошибками: ${errorFeeds}`);
   }
@@ -221,17 +221,16 @@ for (let i = 0; i < config.RSS_FEEDS.length; i++) {
 
       const keywords = await this.getKeywordsCached();
       
-      // Обрабатываем только последние 5 новостей чтобы не перегружать
-const keywords = await db.getKeywords();
+      // Обрабатываем только последние 10 новостей чтобы не перегружать
+      const MAX_ITEMS_PER_FEED = 10;
+      const recentItems = feed.items.slice(0, MAX_ITEMS_PER_FEED);
 
-// Обрабатываем только последние 10 новостей чтобы не перегружать
-const MAX_ITEMS_PER_FEED = 10;
-const recentItems = feed.items.slice(0, MAX_ITEMS_PER_FEED);
+      // Добавляем предупреждение если новостей слишком много
+      if (feed.items && feed.items.length > 50) {
+        log(`⚠️ ВНИМАНИЕ: ${feedUrl} вернул ${feed.items.length} новостей! Обрабатываю только ${MAX_ITEMS_PER_FEED}`);
+      }
 
-// Добавляем предупреждение если новостей слишком много
-if (feed.items && feed.items.length > 50) {
-  log(`⚠️ ВНИМАНИЕ: ${feedUrl} вернул ${feed.items.length} новостей! Обрабатываю только ${MAX_ITEMS_PER_FEED}`);
-}
+      let processedItems = 0;
       
       for (const item of recentItems) {
         try {
@@ -277,16 +276,13 @@ if (feed.items && feed.items.length > 50) {
 
   async processNewsItem(item, feedTitle) {
     const newsId = item.guid || item.link;
-
-async processNewsItem(item, feedTitle) {
-  const newsId = item.guid || item.link;
-  
-  // Проверяем размер новости
-  if (item.content && item.content.length > 10000) {
-    log(`📏 Новость слишком большая (${item.content.length} символов), обрезаю`);
-    item.content = item.content.substring(0, 10000) + '...';
-  }
     
+    // Проверяем размер новости
+    if (item.content && item.content.length > 10000) {
+      log(`📏 Новость слишком большая (${item.content.length} символов), обрезаю`);
+      item.content = item.content.substring(0, 10000) + '...';
+    }
+
     try {
       // Двойная проверка перед отправкой
       const isSent = await db.isNewsSent(newsId);
@@ -314,67 +310,67 @@ async processNewsItem(item, feedTitle) {
     }
   }
 
-formatNewsMessage(item, feedTitle) {
-  const title = item.title || 'Без названия';
-  let content = item.contentSnippet || item.description || item.content || '';
-  
-  // 1. Удаляем ВСЕ HTML теги
-  content = content.replace(/<[^>]*>/g, '').trim();
-  
-  // 2. Обрезаем слишком длинный контент (увеличиваем лимит)
-  const MAX_CONTENT_LENGTH = 500;
-  if (content.length > MAX_CONTENT_LENGTH) {
-    content = content.substring(0, MAX_CONTENT_LENGTH) + '...';
-  }
-  
-  // 3. Если контент пустой, используем заголовок
-  if (!content) {
-    content = title;
-  }
-  
-  const link = item.link || '';
-  const source = feedTitle || 'Неизвестный источник';
-  
-  // 4. Экранируем ВЕСЬ текст для безопасности
-  const safeTitle = this.escapeHtml(title);
-  const safeContent = this.escapeHtml(content);
-  const safeSource = this.escapeHtml(source);
-  
-  // 5. Формируем ссылку безопасно
-  let safeLink = '';
-  if (link) {
-    // Простая проверка что ссылка начинается с http
-    if (link.startsWith('http://') || link.startsWith('https://')) {
-      safeLink = `🔗 <a href="${link}">Читать полностью</a>`;
-    } else {
-      // Если ссылка странная, показываем как текст
-      safeLink = `🔗 Ссылка: ${this.escapeHtml(link)}`;
+  formatNewsMessage(item, feedTitle) {
+    const title = item.title || 'Без названия';
+    let content = item.contentSnippet || item.description || item.content || '';
+    
+    // 1. Удаляем ВСЕ HTML теги
+    content = content.replace(/<[^>]*>/g, '').trim();
+    
+    // 2. Обрезаем слишком длинный контент (увеличиваем лимит)
+    const MAX_CONTENT_LENGTH = 500;
+    if (content.length > MAX_CONTENT_LENGTH) {
+      content = content.substring(0, MAX_CONTENT_LENGTH) + '...';
     }
-  }
-  
-  // 6. Формируем финальное сообщение
-  return `
+    
+    // 3. Если контент пустой, используем заголовок
+    if (!content) {
+      content = title;
+    }
+    
+    const link = item.link || '';
+    const source = feedTitle || 'Неизвестный источник';
+    
+    // 4. Экранируем ВЕСЬ текст для безопасности
+    const safeTitle = this.escapeHtml(title);
+    const safeContent = this.escapeHtml(content);
+    const safeSource = this.escapeHtml(source);
+    
+    // 5. Формируем ссылку безопасно
+    let safeLink = '';
+    if (link) {
+      // Простая проверка что ссылка начинается с http
+      if (link.startsWith('http://') || link.startsWith('https://')) {
+        safeLink = `🔗 <a href="${link}">Читать полностью</a>`;
+      } else {
+        // Если ссылка странная, показываем как текст
+        safeLink = `🔗 Ссылка: ${this.escapeHtml(link)}`;
+      }
+    }
+    
+    // 6. Формируем финальное сообщение
+    return `
 📰 <b>${safeTitle}</b>
 
 ${safeContent}
 
 ${safeLink}
 📋 Источник: ${safeSource}
-  `.trim();
-}
+    `.trim();
+  }
 
-escapeHtml(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;')
-    .replace(/\$/g, '&#36;')     // знак доллара
-    .replace(/`/g, '&#96;')      // обратная кавычка
-    .replace(/\|/g, '&#124;');   // вертикальная черта
-}
+  escapeHtml(text) {
+    if (!text) return '';
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;')
+      .replace(/\$/g, '&#36;')     // знак доллара
+      .replace(/`/g, '&#96;')      // обратная кавычка
+      .replace(/\|/g, '&#124;');   // вертикальная черта
+  }
 
   // Метод для ручной проверки (может быть полезен для отладки)
   async manualCheck() {
