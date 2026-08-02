@@ -2,39 +2,9 @@ const { Telegraf, Markup } = require('telegraf');
 const db = require('./db');
 const config = require('./config');
 const newsService = require('./newsService');
-const fs = require('fs');
-const path = require('path');
-
-// Улучшенная система логирования с управлением потоком
-let logStream;
-
-function createLogStream() {
-  if (logStream) {
-    try {
-      logStream.end(); // Аккуратно закрываем предыдущий поток
-    } catch (e) {
-      console.error('Ошибка закрытия logStream:', e.message);
-    }
-  }
-  logStream = fs.createWriteStream(path.join(__dirname, 'bot.log'), { flags: 'a' });
-  return logStream;
-}
-
-function log(msg) {
-  const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
-  const logMsg = `[${timestamp}] ${msg}\n`;
-  
-  if (!logStream || logStream.destroyed) {
-    logStream = createLogStream();
-  }
-  
-  try {
-    logStream.write(logMsg);
-    console.log(logMsg);
-  } catch (error) {
-    console.error('Ошибка записи в лог:', error.message);
-  }
-}
+const queue = require('./queue');
+const errorHandler = require('./errorHandler');
+const { botLogger } = require('./utils/logger');
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map(); // Добавляем timestamp для состояний
@@ -65,74 +35,76 @@ let isForwardingActive = false;
 async function sendMessageToTargetChannels(message, options = {}) {
   try {
     const targetChannels = await db.getTargetChannels();
-    
+
     if (targetChannels.length === 0) {
-      log('⚠️ Нет целевых каналов для отправки сообщения');
+      botLogger.warn('⚠️ Нет целевых каналов для отправки сообщения');
       return false;
     }
 
     let successCount = 0;
+
     for (const targetChannel of targetChannels) {
-      try {
-        await bot.telegram.sendMessage(targetChannel.channel_id, message, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: false,
-          ...options
-        });
-        log(`✅ Отправлено сообщение в канал ${targetChannel.channel_id}`);
-        successCount++;
-        await new Promise(resolve => setTimeout(resolve, 300));
-      } catch (error) {
-        log(`❌ Ошибка отправки в канал ${targetChannel.channel_id}: ${error.message}`);
-      }
+      queue.add(async () => {
+        try {
+          await bot.telegram.sendMessage(targetChannel.channel_id, message, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: false,
+            ...options
+          });
+
+          botLogger.info(`✅ Отправлено сообщение в канал ${targetChannel.channel_id}`);
+          successCount++;
+        } catch (error) {
+          errorHandler.handleError(error, `bot.js: sendMessageToTargetChannels (queue task for ${targetChannel.channel_id})`);
+        }
+      });
     }
-    
-    return successCount > 0;
+
+    return true;
   } catch (error) {
-    log(`❌ Ошибка в sendMessageToTargetChannels: ${error.message}`);
+    errorHandler.handleError(error, 'bot.js: sendMessageToTargetChannels (outer)');
     return false;
   }
 }
+
 
 async function forwardMessageFromChannel(channelId, messageId) {
   try {
     const targetChannels = await db.getTargetChannels();
     const isAlreadyForwarded = await db.isMessageForwarded(messageId, channelId);
-    
+
     if (isAlreadyForwarded) {
-      log(`⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано`);
+      botLogger.warn(`⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано`);
       return;
     }
 
     if (targetChannels.length === 0) {
-      log('⚠️ Нет целевых каналов для пересылки');
+      botLogger.warn('⚠️ Нет целевых каналов для пересылки');
       return;
     }
 
-    let successCount = 0;
     for (const targetChannel of targetChannels) {
-      try {
-        await bot.telegram.forwardMessage(
-          targetChannel.channel_id,
-          channelId,
-          messageId
-        );
-        log(`✅ Переслано сообщение ${messageId} в канал ${targetChannel.channel_id}`);
-        successCount++;
-        await new Promise(resolve => setTimeout(resolve, 300));
-      } catch (error) {
-        log(`❌ Ошибка пересылки в канал ${targetChannel.channel_id}: ${error.message}`);
-      }
+      queue.add(async () => {
+        try {
+          await bot.telegram.forwardMessage(
+            targetChannel.channel_id,
+            channelId,
+            messageId
+          );
+
+          await db.addForwardedMessage(messageId, channelId);
+
+          botLogger.info(`📤 Переслано сообщение ${messageId} → ${targetChannel.channel_id}`);
+        } catch (error) {
+          errorHandler.handleError(error, `bot.js: forwardMessageFromChannel (queue task for ${targetChannel.channel_id})`);
+        }
+      });
     }
-    
-    if (successCount > 0) {
-      await db.addForwardedMessage(messageId, channelId);
-    }
-    
   } catch (error) {
-    log(`❌ Ошибка в forwardMessageFromChannel: ${error.message}`);
+    errorHandler.handleError(error, 'bot.js: forwardMessageFromChannel (outer)');
   }
 }
+
 
 async function addChannelSimple(channelIdentifier, channelType) {
   try {
@@ -168,10 +140,10 @@ async function addChannelSimple(channelIdentifier, channelType) {
         `⚠️ Канал "${channelIdentifier}" уже существует в базе`
     };
   } catch (error) {
-    log(`❌ Ошибка добавления канала ${channelIdentifier}: ${error.message}`);
+    errorHandler.handleError(error, `bot.js: addChannelSimple (${channelType})`);
     return {
       success: false,
-      message: `❌ Ошибка добавления канала: ${error.message}`
+      message: '❌ Ошибка при добавлении канала'
     };
   }
 }
@@ -190,7 +162,7 @@ async function removeChannelSimple(ctx, userText, type) {
       return;
     }
 
-    log(`🔍 Поиск канала для удаления: "${userText}"`);
+    botLogger.info(`🔍 Поиск канала для удаления: "${userText}"`);
 
     const found = allChannels.find(ch => 
       ch.channel_id === userText ||
@@ -210,7 +182,7 @@ async function removeChannelSimple(ctx, userText, type) {
       return;
     }
 
-    log(`🗑️ Удаляем канал: ${found.channel_id}`);
+    botLogger.info(`🗑️ Удаляем канал: ${found.channel_id}`);
     const removed = await removeFunc(found.channel_id);
     
     if (removed > 0) {
@@ -218,23 +190,20 @@ async function removeChannelSimple(ctx, userText, type) {
     } else {
       ctx.reply(`⚠️ Не удалось удалить канал "${userText}".`, menu);
     }
-  } catch (err) {
-    log(`❌ Ошибка при удалении канала: ${err.message}`);
-    ctx.reply('❌ Произошла ошибка при удалении канала.', menu);
+  } catch (error) {
+    errorHandler.handleError(error, `bot.js: removeChannelSimple (${type})`);
+    ctx.reply(`❌ Ошибка при удалении канала: ${error.message}`, menu);
   }
 }
 
 // Функция для безопасного завершения работы
 async function shutdown() {
-  log('🔴 Завершение работы бота...');
+  botLogger.info('🔴 Завершение работы бота...');
   try {
-    if (logStream) {
-      logStream.end();
-    }
     await bot.stop();
     process.exit(0);
   } catch (error) {
-    console.error('Ошибка при завершении:', error);
+    errorHandler.handleError(error, 'bot.js: shutdown');
     process.exit(1);
   }
 }
@@ -252,7 +221,7 @@ setInterval(() => {
   }
   
   if (clearedCount > 0) {
-    log(`🧹 Очищено ${clearedCount} устаревших состояний пользователей`);
+    botLogger.info(`🧹 Очищено ${clearedCount} устаревших состояний пользователей`);
   }
 }, 5 * 60 * 1000); // Проверка каждые 5 минут
 
@@ -262,26 +231,36 @@ bot.start(async (ctx) => {
     newsService.setSendFunction(sendMessageToTargetChannels);
     ctx.reply('👋 Привет! Я бот для мониторинга и пересылки новостей.', mainMenu);
   } catch (error) {
-    log(`❌ Ошибка в команде start: ${error.message}`);
-    ctx.reply('❌ Произошла ошибка при инициализации бота.');
+    errorHandler.handleError(error, 'bot.js: bot.start');
+    ctx.reply('❌ Ошибка при запуске бота. Проверьте логи.');
   }
 });
 
 bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
 
 bot.hears('🔄 Запустить пересылку', async (ctx) => {
-  isForwardingActive = true;
-  newsService.setSendFunction(sendMessageToTargetChannels);
-  await newsService.startMonitoring();
-  ctx.reply('✅ Пересылка сообщений активирована!', mainMenu);
-  log('🔄 Пересылка сообщений активирована пользователем');
+  try {
+    isForwardingActive = true;
+    newsService.setSendFunction(sendMessageToTargetChannels);
+    await newsService.startMonitoring();
+    ctx.reply('✅ Пересылка сообщений активирована!', mainMenu);
+    botLogger.info('🔄 Пересылка сообщений активирована пользователем');
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: hears "Запустить пересылку"');
+    ctx.reply('❌ Ошибка при активации пересылки.');
+  }
 });
 
 bot.hears('⏹️ Остановить пересылку', async (ctx) => {
-  isForwardingActive = false;
-  await newsService.stopMonitoring();
-  ctx.reply('⏹️ Пересылка сообщений остановлена!', mainMenu);
-  log('⏹️ Пересылка сообщений остановлена пользователем');
+  try {
+    isForwardingActive = false;
+    await newsService.stopMonitoring();
+    ctx.reply('⏹️ Пересылка сообщений остановлена!', mainMenu);
+    botLogger.info('⏹️ Пересылка сообщений остановлена пользователем');
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: hears "Остановить пересылку"');
+    ctx.reply('❌ Ошибка при остановке пересылки.');
+  }
 });
 
 bot.hears('🗝️ Ключевые слова', async (ctx) => {
@@ -290,6 +269,7 @@ bot.hears('🗝️ Ключевые слова', async (ctx) => {
     const list = keywords.length ? keywords.map(k => `🔹 ${k}`).join('\n') : '— нет —';
     ctx.reply(`📜 Текущие ключевые слова:\n${list}`, keywordsMenu);
   } catch (error) {
+    errorHandler.handleError(error, 'bot.js: hears "Ключевые слова"');
     ctx.reply('❌ Ошибка при получении ключевых слов.');
   }
 });
@@ -318,7 +298,8 @@ bot.hears('🎯 Целевые каналы', async (ctx) => {
       : '— нет —';
     ctx.reply(`🎯 Целевые каналы:\n${list}`, targetChannelsMenu);
   } catch (error) {
-    ctx.reply('❌ Ошибка при получении списка целевых каналов.');
+    errorHandler.handleError(error, 'bot.js: hears "Целевые каналы"');
+    ctx.reply('❌ Ошибка при получении целевых каналов.');
   }
 });
 
@@ -346,7 +327,8 @@ bot.hears('📡 Мониторинг каналов', async (ctx) => {
       : '— нет —';
     ctx.reply(`📡 Отслеживаемые каналы:\n${list}`, monitoredChannelsMenu);
   } catch (error) {
-    ctx.reply('❌ Ошибка при получении списка отслеживаемых каналов.');
+    errorHandler.handleError(error, 'bot.js: hears "Мониторинг каналов"');
+    ctx.reply('❌ Ошибка при получении отслеживаемых каналов.');
   }
 });
 
@@ -386,9 +368,9 @@ bot.hears('📈 Статистика', async (ctx) => {
     `;
     ctx.reply(msg, mainMenu);
 
-  } catch (err) {
-    console.error('❌ Ошибка при получении статистики:', err);
-    ctx.reply('⚠️ Не удалось получить статистику.');
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: hears "Статистика"');
+    ctx.reply('❌ Ошибка при получении статистики.');
   }
 });
 
@@ -402,17 +384,17 @@ bot.on('channel_post', async (ctx) => {
     const channelId = channelPost.chat.id.toString();
     const messageId = channelPost.message_id;
 
-    log(`📨 Получен channel_post из канала ${channelId}: ${messageId}`);
+    botLogger.info(`📨 Получен channel_post из канала ${channelId}: ${messageId}`);
 
     const monitoredChannels = await db.getMonitoredChannels();
     const isMonitored = monitoredChannels.some(ch => ch.channel_id === channelId);
 
     if (isMonitored) {
-      log(`🎯 Канал ${channelId} отслеживается, пересылаем сообщение ${messageId}`);
+      botLogger.info(`🎯 Канал ${channelId} отслеживается, пересылаем сообщение ${messageId}`);
       await forwardMessageFromChannel(channelId, messageId);
     }
   } catch (error) {
-    log(`❌ Ошибка обработки channel_post: ${error.message}`);
+    errorHandler.handleError(error, 'bot.js: channel_post handler');
   }
 });
 
@@ -475,17 +457,15 @@ bot.on('message', async (ctx) => {
       return;
     }
 
-  } catch (err) {
-    console.error('❌ Ошибка при обработке ввода:', err);
-    // ОЧИСТКА СОСТОЯНИЯ ПРИ ОШИБКЕ
-    userStates.delete(userId);
-    ctx.reply('❌ Произошла ошибка. Ваше состояние сброшено. Пожалуйста, попробуйте снова.', mainMenu);
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: message handler (state processing)');
+    ctx.reply('❌ Произошла ошибка при обработке команды.');
   }
 });
 
 async function startBot() {
   try {
-    log('🚀 Запуск бота...');
+    botLogger.info('🚀 Запуск бота...');
     
     // Инициализация БД с повторными попытками
     let dbInitialized = false;
@@ -494,44 +474,52 @@ async function startBot() {
       try {
         await db.initializeDB();
         dbInitialized = true;
-        log('✅ База данных инициализирована');
-      } catch (dbError) {
+        botLogger.info('✅ База данных инициализирована');
+      } catch (error) {
         attempts++;
-        log(`❌ Попытка ${attempts}/3 инициализации БД не удалась: ${dbError.message}`);
-        if (attempts === 3) throw dbError;
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        errorHandler.handleError(error, `bot.js: startBot (DB init attempt ${attempts})`);
+        botLogger.warn(`⚠️ Попытка инициализации БД #${attempts} не удалась`);
+        if (attempts < 3) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
       }
+    }
+
+    if (!dbInitialized) {
+      botLogger.error('❌ Не удалось инициализировать БД после 3 попыток. Завершаем работу.');
+      process.exit(1);
     }
 
     await newsService.initialize();
     await bot.launch();
-    log('✅ Бот запущен и готов к работе.');
+    botLogger.info('✅ Бот запущен и готов к работе.');
     newsService.setSendFunction(sendMessageToTargetChannels);
-    log('✅ Функция отправки установлена');
+    botLogger.info('✅ Функция отправки установлена');
   } catch (error) {
-    log(`❌ Критическая ошибка запуска бота: ${error.message}`);
-    // Даем время записать логи перед выходом
-    setTimeout(() => process.exit(1), 1000);
+    errorHandler.handleError(error, 'bot.js: startBot (outer)');
+    botLogger.error('❌ Критическая ошибка при запуске бота. Завершаем работу.');
+    process.exit(1);
   }
 }
 
-process.on('unhandledRejection', (reason, promise) => {
-  log(`❌ Необработанное отклонение promise: ${reason}`);
+// Глобальные обработчики с использованием errorHandler
+process.on('unhandledRejection', (reason) => {
+  errorHandler.handleError(reason, 'GLOBAL: unhandledRejection');
 });
 
 process.on('uncaughtException', (error) => {
-  log(`❌ Непойманное исключение: ${error.message}`);
-  process.exit(1);
+  errorHandler.handleError(error, 'GLOBAL: uncaughtException');
+  setTimeout(() => process.exit(1), 1000);
 });
 
 startBot();
 
 process.once('SIGINT', () => {
-  log('⏹️ Остановка бота по SIGINT');
+  botLogger.info('⏹️ Остановка бота по SIGINT');
   shutdown();
 });
 
 process.once('SIGTERM', () => {
-  log('⏹️ Остановка бота по SIGTERM');
+  botLogger.info('⏹️ Остановка бота по SIGTERM');
   shutdown();
 });

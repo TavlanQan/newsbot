@@ -1,59 +1,38 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-
-const dbPath = path.join(__dirname, 'news_bot.db');
+const errorHandler = require('./errorHandler');
+const { dbLogger } = require('./utils/logger');
+const config = require('./config');
+const dbPath = path.resolve(config.DB_PATH);
 const db = new sqlite3.Database(dbPath);
 
-// Безопасное логирование для db.js
-function safeLog(message, isError = false) {
-  const timestamp = new Date().toISOString().replace('T', ' ').split('.')[0];
-  const logMessage = `[${timestamp}] [DB] ${message}`;
-  
-  if (isError) {
-    console.error(logMessage);
-  } else {
-    console.log(logMessage);
-  }
-}
+// Включаем WAL-режим
+db.run('PRAGMA journal_mode = WAL;');
 
-// Функция для безопасного выполнения SQL с обработкой ошибок
+// Обёртки (без логирования внутри)
 function runSQL(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function(err) {
-      if (err) {
-        safeLog(`❌ SQL ошибка: ${err.message} - Запрос: ${sql}`, true);
-        reject(err);
-      } else {
-        resolve(this);
-      }
+      if (err) reject(err);
+      else resolve(this);
     });
   });
 }
 
-// Функция для безопасного получения всех записей
 function getAllSQL(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.all(sql, params, (err, rows) => {
-      if (err) {
-        safeLog(`❌ SQL ошибка: ${err.message} - Запрос: ${sql}`, true);
-        reject(err);
-      } else {
-        resolve(rows);
-      }
+      if (err) reject(err);
+      else resolve(rows);
     });
   });
 }
 
-// Функция для безопасного получения одной записи
 function getSQL(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => {
-      if (err) {
-        safeLog(`❌ SQL ошибка: ${err.message} - Запрос: ${sql}`, true);
-        reject(err);
-      } else {
-        resolve(row);
-      }
+      if (err) reject(err);
+      else resolve(row);
     });
   });
 }
@@ -61,9 +40,8 @@ function getSQL(sql, params = []) {
 function initializeDB() {
   return new Promise(async (resolve, reject) => {
     try {
-      safeLog('🔄 Инициализация базы данных...');
+      dbLogger.info('🔄 Инициализация базы данных...');
 
-      // Создаем таблицы последовательно с обработкой ошибок
       await runSQL(`CREATE TABLE IF NOT EXISTS keywords (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         keyword TEXT UNIQUE NOT NULL,
@@ -107,21 +85,21 @@ function initializeDB() {
         UNIQUE(original_message_id, channel_id)
       )`);
 
-      // Создаем индексы для улучшения производительности
+      // Индексы
       await runSQL('CREATE INDEX IF NOT EXISTS idx_sent_news_id ON sent_news(news_id)');
       await runSQL('CREATE INDEX IF NOT EXISTS idx_forwarded_messages_composite ON forwarded_messages(original_message_id, channel_id)');
       await runSQL('CREATE INDEX IF NOT EXISTS idx_monitored_channels_id ON monitored_channels(channel_id)');
       await runSQL('CREATE INDEX IF NOT EXISTS idx_target_channels_id ON target_channels(channel_id)');
 
-      // Добавляем настройки по умолчанию
+      // Настройки по умолчанию
       const defaultSettings = [
         ['auto_post_enabled', 'true'],
         ['check_interval', '30'],
         ['channel_monitoring_enabled', 'true']
       ];
-      
+
       const stmt = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
-      
+
       for (const [key, value] of defaultSettings) {
         try {
           await new Promise((resolveStmt, rejectStmt) => {
@@ -131,16 +109,21 @@ function initializeDB() {
             });
           });
         } catch (error) {
-          safeLog(`⚠️ Не удалось добавить настройку ${key}: ${error.message}`, false);
+          errorHandler.handleError(
+            error,
+            `db: initializeDB setting insert failed for ${key}`,
+            'WARN'
+          );
+          dbLogger.warn(`⚠️ Не удалось добавить настройку ${key}: ${error.message}`);
         }
       }
-      
+
       stmt.finalize();
-      
-      safeLog('✅ База данных успешно инициализирована');
+
+      dbLogger.info('✅ База данных успешно инициализирована');
       resolve();
     } catch (error) {
-      safeLog(`❌ Ошибка инициализации базы данных: ${error.message}`, true);
+      errorHandler.handleError(error, 'db: initializeDB');
       reject(error);
     }
   });
@@ -148,20 +131,22 @@ function initializeDB() {
 
 function addKeyword(keyword) {
   return new Promise((resolve, reject) => {
-    // Валидация ключевого слова
     if (!keyword || typeof keyword !== 'string' || keyword.trim().length === 0) {
-      safeLog('❌ Попытка добавить пустое ключевое слово', true);
-      return reject(new Error('Ключевое слово не может быть пустым'));
+      const err = new Error('Ключевое слово не может быть пустым');
+      errorHandler.handleError(err, 'db: addKeyword validation', 'WARN');
+      return reject(err);
     }
 
     const trimmedKeyword = keyword.trim();
-    
+
     db.run('INSERT OR IGNORE INTO keywords (keyword) VALUES (?)', [trimmedKeyword], function(err) {
       if (err) {
-        safeLog(`❌ Ошибка добавления ключевого слова "${trimmedKeyword}": ${err.message}`, true);
+        errorHandler.handleError(err, `db: addKeyword "${trimmedKeyword}"`);
         reject(err);
       } else {
-        safeLog(`✅ Добавлено ключевых слов: ${this.changes} - "${trimmedKeyword}"`);
+        if (this.changes > 0) {
+          dbLogger.info(`✅ Добавлено ключевое слово: "${trimmedKeyword}"`);
+        }
         resolve(this.changes);
       }
     });
@@ -171,15 +156,19 @@ function addKeyword(keyword) {
 function removeKeyword(keyword) {
   return new Promise((resolve, reject) => {
     if (!keyword || typeof keyword !== 'string') {
-      return reject(new Error('Неверный формат ключевого слова'));
+      const err = new Error('Неверный формат ключевого слова');
+      errorHandler.handleError(err, 'db: removeKeyword validation', 'WARN');
+      return reject(err);
     }
 
     db.run('DELETE FROM keywords WHERE keyword = ?', [keyword], function(err) {
       if (err) {
-        safeLog(`❌ Ошибка удаления ключевого слова "${keyword}": ${err.message}`, true);
+        errorHandler.handleError(err, `db: removeKeyword "${keyword}"`);
         reject(err);
       } else {
-        safeLog(`✅ Удалено ключевых слов: ${this.changes} - "${keyword}"`);
+        if (this.changes > 0) {
+          dbLogger.info(`✅ Удалено ключевое слово: "${keyword}"`);
+        }
         resolve(this.changes);
       }
     });
@@ -190,7 +179,7 @@ function getKeywords() {
   return new Promise((resolve, reject) => {
     db.all('SELECT keyword FROM keywords ORDER BY keyword', (err, rows) => {
       if (err) {
-        safeLog(`❌ Ошибка получения ключевых слов: ${err.message}`, true);
+        errorHandler.handleError(err, 'db: getKeywords');
         reject(err);
       } else {
         resolve(rows.map(row => row.keyword));
@@ -201,10 +190,10 @@ function getKeywords() {
 
 function addSentNews(newsId, title, url) {
   return new Promise((resolve, reject) => {
-    // Валидация данных
     if (!newsId || !title || !url) {
-      safeLog(`⚠️ Попытка добавить неполную запись новости: ${newsId}`, true);
-      return reject(new Error('Неполные данные новости'));
+      const err = new Error('Неполные данные новости');
+      errorHandler.handleError(err, 'db: addSentNews validation', 'WARN');
+      return reject(err);
     }
 
     db.run(
@@ -212,11 +201,11 @@ function addSentNews(newsId, title, url) {
       [newsId, title, url],
       function(err) {
         if (err) {
-          safeLog(`❌ Ошибка добавления отправленной новости ${newsId}: ${err.message}`, true);
+          errorHandler.handleError(err, `db: addSentNews ${newsId}`);
           reject(err);
         } else {
           if (this.changes > 0) {
-            safeLog(`✅ Добавлена отправленная новость: ${title.substring(0, 50)}...`);
+            dbLogger.info(`✅ Добавлена отправленная новость: ${title.substring(0, 50)}...`);
           }
           resolve(this.changes);
         }
@@ -233,7 +222,7 @@ function isNewsSent(newsId) {
 
     db.get('SELECT 1 FROM sent_news WHERE news_id = ?', [newsId], (err, row) => {
       if (err) {
-        safeLog(`❌ Ошибка проверки новости ${newsId}: ${err.message}`, true);
+        errorHandler.handleError(err, `db: isNewsSent ${newsId}`);
         reject(err);
       } else {
         resolve(!!row);
@@ -244,23 +233,25 @@ function isNewsSent(newsId) {
 
 function addTargetChannel(channelId, username = null, title = null) {
   return new Promise((resolve, reject) => {
-    // Валидация channelId
     if (!channelId || typeof channelId !== 'string') {
-      safeLog('❌ Попытка добавить целевой канал с неверным ID', true);
-      return reject(new Error('Неверный ID канала'));
+      const err = new Error('Неверный ID канала');
+      errorHandler.handleError(err, 'db: addTargetChannel validation', 'WARN');
+      return reject(err);
     }
 
-    safeLog(`➕ Добавление целевого канала: "${channelId}"`);
-    
+    dbLogger.info(`➕ Добавление целевого канала: "${channelId}"`);
+
     db.run(
       'INSERT OR IGNORE INTO target_channels (channel_id, channel_username, channel_title) VALUES (?, ?, ?)',
       [channelId, username, title],
       function(err) {
         if (err) {
-          safeLog(`❌ Ошибка добавления целевого канала "${channelId}": ${err.message}`, true);
+          errorHandler.handleError(err, `db: addTargetChannel ${channelId}`);
           reject(err);
         } else {
-          safeLog(`✅ Добавлено целевых каналов: ${this.changes} - "${channelId}"`);
+          if (this.changes > 0) {
+            dbLogger.info(`✅ Добавлен целевой канал: "${channelId}"`);
+          }
           resolve(this.changes);
         }
       }
@@ -271,17 +262,21 @@ function addTargetChannel(channelId, username = null, title = null) {
 function removeTargetChannel(channelId) {
   return new Promise((resolve, reject) => {
     if (!channelId) {
-      return reject(new Error('ID канала не может быть пустым'));
+      const err = new Error('ID канала не может быть пустым');
+      errorHandler.handleError(err, 'db: removeTargetChannel validation', 'WARN');
+      return reject(err);
     }
 
-    safeLog(`🗑️ Удаление целевого канала ID: "${channelId}"`);
-    
+    dbLogger.info(`🗑️ Удаление целевого канала ID: "${channelId}"`);
+
     db.run('DELETE FROM target_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
-        safeLog(`❌ Ошибка удаления целевого канала "${channelId}": ${err.message}`, true);
+        errorHandler.handleError(err, `db: removeTargetChannel ${channelId}`);
         reject(err);
       } else {
-        safeLog(`✅ Удалено целевых каналов: ${this.changes} - "${channelId}"`);
+        if (this.changes > 0) {
+          dbLogger.info(`✅ Удален целевой канал: "${channelId}"`);
+        }
         resolve(this.changes);
       }
     });
@@ -292,7 +287,7 @@ function getTargetChannels() {
   return new Promise((resolve, reject) => {
     db.all('SELECT channel_id, channel_username, channel_title FROM target_channels ORDER BY channel_id', (err, rows) => {
       if (err) {
-        safeLog(`❌ Ошибка получения целевых каналов: ${err.message}`, true);
+        errorHandler.handleError(err, 'db: getTargetChannels');
         reject(err);
       } else {
         resolve(rows);
@@ -304,21 +299,24 @@ function getTargetChannels() {
 function addMonitoredChannel(channelId, username = null, title = null) {
   return new Promise((resolve, reject) => {
     if (!channelId || typeof channelId !== 'string') {
-      safeLog('❌ Попытка добавить отслеживаемый канал с неверным ID', true);
-      return reject(new Error('Неверный ID канала'));
+      const err = new Error('Неверный ID канала');
+      errorHandler.handleError(err, 'db: addMonitoredChannel validation', 'WARN');
+      return reject(err);
     }
 
-    safeLog(`➕ Добавление отслеживаемого канала: "${channelId}"`);
-    
+    dbLogger.info(`➕ Добавление отслеживаемого канала: "${channelId}"`);
+
     db.run(
       'INSERT OR IGNORE INTO monitored_channels (channel_id, channel_username, channel_title) VALUES (?, ?, ?)',
       [channelId, username, title],
       function(err) {
         if (err) {
-          safeLog(`❌ Ошибка добавления отслеживаемого канала "${channelId}": ${err.message}`, true);
+          errorHandler.handleError(err, `db: addMonitoredChannel ${channelId}`);
           reject(err);
         } else {
-          safeLog(`✅ Добавлено отслеживаемых каналов: ${this.changes} - "${channelId}"`);
+          if (this.changes > 0) {
+            dbLogger.info(`✅ Добавлен отслеживаемый канал: "${channelId}"`);
+          }
           resolve(this.changes);
         }
       }
@@ -329,17 +327,21 @@ function addMonitoredChannel(channelId, username = null, title = null) {
 function removeMonitoredChannel(channelId) {
   return new Promise((resolve, reject) => {
     if (!channelId) {
-      return reject(new Error('ID канала не может быть пустым'));
+      const err = new Error('ID канала не может быть пустым');
+      errorHandler.handleError(err, 'db: removeMonitoredChannel validation', 'WARN');
+      return reject(err);
     }
 
-    safeLog(`🗑️ Удаление отслеживаемого канала ID: "${channelId}"`);
-    
+    dbLogger.info(`🗑️ Удаление отслеживаемого канала ID: "${channelId}"`);
+
     db.run('DELETE FROM monitored_channels WHERE channel_id = ?', [channelId], function(err) {
       if (err) {
-        safeLog(`❌ Ошибка удаления отслеживаемого канала "${channelId}": ${err.message}`, true);
+        errorHandler.handleError(err, `db: removeMonitoredChannel ${channelId}`);
         reject(err);
       } else {
-        safeLog(`✅ Удалено отслеживаемых каналов: ${this.changes} - "${channelId}"`);
+        if (this.changes > 0) {
+          dbLogger.info(`✅ Удален отслеживаемый канал: "${channelId}"`);
+        }
         resolve(this.changes);
       }
     });
@@ -350,7 +352,7 @@ function getMonitoredChannels() {
   return new Promise((resolve, reject) => {
     db.all('SELECT channel_id, channel_username, channel_title FROM monitored_channels ORDER BY channel_id', (err, rows) => {
       if (err) {
-        safeLog(`❌ Ошибка получения отслеживаемых каналов: ${err.message}`, true);
+        errorHandler.handleError(err, 'db: getMonitoredChannels');
         reject(err);
       } else {
         resolve(rows);
@@ -362,7 +364,9 @@ function getMonitoredChannels() {
 function addForwardedMessage(originalMessageId, channelId) {
   return new Promise((resolve, reject) => {
     if (!originalMessageId || !channelId) {
-      return reject(new Error('Неполные данные для пересылаемого сообщения'));
+      const err = new Error('Неполные данные для пересылаемого сообщения');
+      errorHandler.handleError(err, 'db: addForwardedMessage validation', 'WARN');
+      return reject(err);
     }
 
     db.run(
@@ -370,11 +374,11 @@ function addForwardedMessage(originalMessageId, channelId) {
       [originalMessageId, channelId],
       function(err) {
         if (err) {
-          safeLog(`❌ Ошибка добавления пересланного сообщения ${originalMessageId}: ${err.message}`, true);
+          errorHandler.handleError(err, `db: addForwardedMessage ${originalMessageId}, ${channelId}`);
           reject(err);
         } else {
           if (this.changes > 0) {
-            safeLog(`✅ Добавлено пересланное сообщение: ${originalMessageId} из канала ${channelId}`);
+            dbLogger.info(`✅ Добавлено пересланное сообщение: ${originalMessageId} из канала ${channelId}`);
           }
           resolve(this.changes);
         }
@@ -394,7 +398,7 @@ function isMessageForwarded(originalMessageId, channelId) {
       [originalMessageId, channelId],
       (err, row) => {
         if (err) {
-          safeLog(`❌ Ошибка проверки пересланного сообщения ${originalMessageId}: ${err.message}`, true);
+          errorHandler.handleError(err, `db: isMessageForwarded ${originalMessageId}, ${channelId}`);
           reject(err);
         } else {
           resolve(!!row);
@@ -407,12 +411,14 @@ function isMessageForwarded(originalMessageId, channelId) {
 function getSetting(key) {
   return new Promise((resolve, reject) => {
     if (!key) {
-      return reject(new Error('Ключ настройки не может быть пустым'));
+      const err = new Error('Ключ настройки не может быть пустым');
+      errorHandler.handleError(err, 'db: getSetting validation', 'WARN');
+      return reject(err);
     }
 
     db.get('SELECT value FROM settings WHERE key = ?', [key], (err, row) => {
       if (err) {
-        safeLog(`❌ Ошибка получения настройки ${key}: ${err.message}`, true);
+        errorHandler.handleError(err, `db: getSetting ${key}`);
         reject(err);
       } else {
         resolve(row ? row.value : null);
@@ -424,15 +430,17 @@ function getSetting(key) {
 function setSetting(key, value) {
   return new Promise((resolve, reject) => {
     if (!key || value === undefined || value === null) {
-      return reject(new Error('Неполные данные для настройки'));
+      const err = new Error('Неполные данные для настройки');
+      errorHandler.handleError(err, 'db: setSetting validation', 'WARN');
+      return reject(err);
     }
 
     db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value], function(err) {
       if (err) {
-        safeLog(`❌ Ошибка установки настройки ${key}: ${err.message}`, true);
+        errorHandler.handleError(err, `db: setSetting ${key}`);
         reject(err);
       } else {
-        safeLog(`✅ Настройка обновлена: ${key} = ${value}`);
+        dbLogger.info(`✅ Настройка обновлена: ${key} = ${value}`);
         resolve();
       }
     });
@@ -443,7 +451,7 @@ function countForwardedMessages() {
   return new Promise((resolve, reject) => {
     db.get('SELECT COUNT(*) as count FROM forwarded_messages', (err, row) => {
       if (err) {
-        safeLog(`❌ Ошибка подсчета пересланных сообщений: ${err.message}`, true);
+        errorHandler.handleError(err, 'db: countForwardedMessages');
         reject(err);
       } else {
         resolve(row ? row.count : 0);
@@ -456,7 +464,7 @@ function countSentNews() {
   return new Promise((resolve, reject) => {
     db.get('SELECT COUNT(*) as count FROM sent_news', (err, row) => {
       if (err) {
-        safeLog(`❌ Ошибка подсчета отправленных новостей: ${err.message}`, true);
+        errorHandler.handleError(err, 'db: countSentNews');
         reject(err);
       } else {
         resolve(row ? row.count : 0);
@@ -465,15 +473,14 @@ function countSentNews() {
   });
 }
 
-// Функция для безопасного закрытия базы данных
 function closeDB() {
   return new Promise((resolve) => {
-    safeLog('🔒 Закрытие соединения с базой данных...');
+    dbLogger.info('🔒 Закрытие соединения с базой данных...');
     db.close((err) => {
       if (err) {
-        safeLog(`⚠️ Ошибка при закрытии базы данных: ${err.message}`, false);
+        errorHandler.handleError(err, 'db: closeDB', 'WARN');
       } else {
-        safeLog('✅ Соединение с базой данных закрыто');
+        dbLogger.info('✅ Соединение с базой данных закрыто');
       }
       resolve();
     });
