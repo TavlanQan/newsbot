@@ -22,6 +22,21 @@ class NewsService {
     this.keywordsCache = [];
     this.lastKeywordsUpdate = 0;
     this.CACHE_TIME = 5 * 60 * 1000;
+    this.feeds = [];  // теперь здесь хранятся все фиды
+  }
+
+  setFeeds(feedsArray) {
+    this.feeds = feedsArray.filter(url => url && url.trim() !== '');
+    rssLogger.info(`📡 Установлено ${this.feeds.length} RSS-фидов`);
+  }
+
+  addFeed(url) {
+    if (!this.feeds.includes(url)) {
+      this.feeds.push(url);
+      rssLogger.info(`➕ Добавлен новый RSS-фид: ${url}`);
+      return true;
+    }
+    return false;
   }
 
   async getKeywordsCached() {
@@ -39,18 +54,29 @@ class NewsService {
     return this.keywordsCache;
   }
 
+  // ========== ИСПРАВЛЕННЫЙ initialize ==========
   async initialize() {
+    // Если фиды ещё не установлены через setFeeds, берём из конфига
+    if (!this.feeds || this.feeds.length === 0) {
+      this.feeds = config.RSS_FEEDS || [];
+    }
     rssLogger.info('📰 Инициализация сервиса новостей...');
     await this.validateFeeds();
   }
 
+  // ========== ИСПРАВЛЕННЫЙ validateFeeds (использует this.feeds) ==========
   async validateFeeds() {
     rssLogger.info('🔍 Проверка доступности RSS-лент...');
     let workingFeeds = 0;
-    const totalFeeds = config.RSS_FEEDS.length;
+    const totalFeeds = this.feeds.length;
+
+    if (totalFeeds === 0) {
+      rssLogger.warn('⚠️ Нет RSS-лент для проверки');
+      return;
+    }
 
     for (let i = 0; i < totalFeeds; i++) {
-      const feedUrl = config.RSS_FEEDS[i];
+      const feedUrl = this.feeds[i];
       try {
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Таймаут проверки')), 10000)
@@ -86,6 +112,7 @@ class NewsService {
     rssLogger.info('✅ Функция отправки установлена в NewsService');
   }
 
+  // ========== ИСПРАВЛЕННЫЙ startMonitoring (интервал из конфига) ==========
   async startMonitoring() {
     if (this.isMonitoring) {
       rssLogger.warn('⚠️ Мониторинг уже запущен');
@@ -102,14 +129,16 @@ class NewsService {
       rssLogger.error(`❌ Ошибка при начальной проверке RSS: ${error.message}`);
     }
 
+    // Интервал из конфига (в минутах)
+    const intervalMs = (config.RSS_UPDATE_INTERVAL || 10) * 60 * 1000;
     this.monitoringInterval = setInterval(() => {
       this.checkAllFeeds().catch(error => {
         errorHandler.handleError(error, 'newsService: periodic check');
         rssLogger.error(`❌ Ошибка в периодической проверке RSS: ${error.message}`);
       });
-    }, 10 * 60 * 1000);
+    }, intervalMs);
 
-    rssLogger.info('✅ Мониторинг RSS-лент запущен');
+    rssLogger.info(`✅ Мониторинг RSS-лент запущен (интервал ${config.RSS_UPDATE_INTERVAL || 10} мин)`);
   }
 
   async stopMonitoring() {
@@ -154,13 +183,16 @@ class NewsService {
     }
   }
 
+  // ========== ИСПРАВЛЕННЫЙ _checkAllFeeds (использует this.feeds) ==========
   async _checkAllFeeds() {
     rssLogger.info('🔍 Начинаем проверку всех RSS-лент...');
     let processedFeeds = 0;
     let errorFeeds = 0;
 
-    for (let i = 0; i < config.RSS_FEEDS.length; i++) {
-      const feedUrl = config.RSS_FEEDS[i];
+    const feeds = this.feeds; // используем динамический список
+
+    for (let i = 0; i < feeds.length; i++) {
+      const feedUrl = feeds[i];
       try {
         await this.processFeed(feedUrl);
         processedFeeds++;
@@ -181,6 +213,7 @@ class NewsService {
     rssLogger.info(`✅ Проверка RSS завершена. Успешно: ${processedFeeds}, с ошибками: ${errorFeeds}`);
   }
 
+  // ========== Остальные методы без изменений ==========
   async processFeed(feedUrl) {
     try {
       const feed = await this.parser.parseURL(feedUrl);
