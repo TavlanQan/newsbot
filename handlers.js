@@ -1,17 +1,22 @@
 // handlers.js
 const { Markup } = require('telegraf');
 
-// Клавиатуры (их можно вынести в отдельный файл, но пока оставим здесь)
+// Клавиатуры
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
   ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
-  ['📺 YouTube каналы', '🔄 Запустить пересылку'],
-  ['⏹️ Остановить пересылку']
+  ['📺 YouTube каналы', '📡 RSS ленты'],
+  ['🔄 Запустить пересылку', '⏹️ Остановить пересылку']
 ]).resize();
 
 const youtubeMenu = Markup.keyboard([
   ['📺 Добавить YouTube', '📋 Список YouTube'],
   ['🗑️ Удалить YouTube', '⬅️ Назад']
+]).resize();
+
+const rssMenu = Markup.keyboard([
+  ['➕ Добавить RSS', '📋 Список RSS'],
+  ['🗑️ Удалить RSS', '⬅️ Назад']
 ]).resize();
 
 const keywordsMenu = Markup.keyboard([
@@ -29,20 +34,6 @@ const monitoredChannelsMenu = Markup.keyboard([
   ['⬅️ Назад']
 ]).resize();
 
-/**
- * Регистрирует все обработчики команд и кнопок.
- * @param {Object} deps - зависимости
- * @param {Telegraf} deps.bot - экземпляр бота
- * @param {Object} deps.db - модуль db
- * @param {Object} deps.config - конфиг
- * @param {Object} deps.newsService - сервис новостей
- * @param {Object} deps.queue - очередь
- * @param {Object} deps.errorHandler - обработчик ошибок
- * @param {Object} deps.logger - логгер
- * @param {Map} deps.userStates - Map состояний пользователей
- * @param {boolean} deps.isForwardingActive - ссылка на флаг активности пересылки
- * @param {Object} deps.helpers - вспомогательные функции
- */
 function registerHandlers(deps) {
   const {
     bot,
@@ -58,9 +49,6 @@ function registerHandlers(deps) {
   } = deps;
 
   const { botLogger } = logger;
-
-  // ---------- Вспомогательные функции для этого модуля ----------
-  // (передаём helpers как есть)
 
   // ---------- Команды ----------
   bot.start(async (ctx) => {
@@ -141,10 +129,56 @@ function registerHandlers(deps) {
     );
   });
 
+  // ---------- RSS подменю ----------
+  bot.hears('📡 RSS ленты', (ctx) => {
+    ctx.reply('📡 Управление RSS-лентами сторонних сайтов:', rssMenu);
+  });
+
+  bot.hears('➕ Добавить RSS', (ctx) => {
+    userStates.set(ctx.from.id, {
+      state: 'waiting_for_rss_add',
+      timestamp: Date.now()
+    });
+    ctx.reply(
+      '📡 Введите URL RSS-ленты сайта (например, https://example.com/rss.xml).\n\n' +
+      'Отправьте "Отмена", чтобы отменить действие.'
+    );
+  });
+
+  bot.hears('📋 Список RSS', async (ctx) => {
+    try {
+      const rssFeeds = await helpers.getRssFeeds();
+      if (rssFeeds.length === 0) {
+        await ctx.reply('📡 Нет добавленных RSS-лент (кроме YouTube).', rssMenu);
+        return;
+      }
+      let message = '📡 <b>Список RSS-лент:</b>\n\n';
+      rssFeeds.forEach((feed, index) => {
+        message += `${index + 1}. ${feed}\n`;
+      });
+      message += '\nДля удаления используйте кнопку "🗑️ Удалить RSS" и введите номер или URL.';
+      await ctx.reply(message, { parse_mode: 'HTML' });
+    } catch (error) {
+      errorHandler.handleError(error, 'handlers.js: hears "Список RSS"');
+      await ctx.reply('❌ Ошибка при получении списка RSS-лент.', rssMenu);
+    }
+  });
+
+  bot.hears('🗑️ Удалить RSS', (ctx) => {
+    userStates.set(ctx.from.id, {
+      state: 'waiting_for_rss_remove',
+      timestamp: Date.now()
+    });
+    ctx.reply(
+      '🗑️ Введите номер или полный URL RSS-ленты для удаления.\n\n' +
+      'Сначала посмотрите список командой "📋 Список RSS".\n' +
+      'Отправьте "Отмена", чтобы отменить действие.'
+    );
+  });
+
   // ---------- Основные функции ----------
   bot.hears('🔄 Запустить пересылку', async (ctx) => {
     try {
-      // Обновляем глобальный флаг
       isForwardingActive.value = true;
       newsService.setSendFunction((msg, opts) => helpers.sendMessageToTargetChannels(bot, msg, opts));
       await newsService.startMonitoring();
@@ -314,9 +348,12 @@ function registerHandlers(deps) {
       // Отмена действия
       if (text.toLowerCase() === 'отмена' && state) {
         userStates.delete(userId);
-        const returnMenu = (state === 'waiting_for_youtube_link' || state === 'waiting_for_youtube_remove')
-          ? youtubeMenu
-          : mainMenu;
+        let returnMenu = mainMenu;
+        if (state === 'waiting_for_youtube_link' || state === 'waiting_for_youtube_remove') {
+          returnMenu = youtubeMenu;
+        } else if (state === 'waiting_for_rss_add' || state === 'waiting_for_rss_remove') {
+          returnMenu = rssMenu;
+        }
         await ctx.reply('❌ Действие отменено. Возвращаюсь в меню.', returnMenu);
         return;
       }
@@ -330,6 +367,18 @@ function registerHandlers(deps) {
 
       if (state === 'waiting_for_youtube_remove') {
         await helpers.handleYouTubeRemove(ctx, text, youtubeMenu);
+        userStates.delete(userId);
+        return;
+      }
+
+      if (state === 'waiting_for_rss_add') {
+        await helpers.addRssFeed(ctx, text, rssMenu);
+        userStates.delete(userId);
+        return;
+      }
+
+      if (state === 'waiting_for_rss_remove') {
+        await helpers.removeRssFeed(ctx, text, rssMenu);
         userStates.delete(userId);
         return;
       }

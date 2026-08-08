@@ -257,6 +257,85 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu) {
   }
 }
 
+// RSS функции (для сайтов)
+async function getRssFeeds() {
+  const currentFeeds = await db.getSetting('rss_feeds') || '';
+  const allFeeds = currentFeeds ? currentFeeds.split(',') : [];
+  const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
+  // Возвращаем все фиды, кроме YouTube
+  return allFeeds.filter(feed => !feed.startsWith(youtubePrefix));
+}
+
+async function addRssFeed(ctx, url, rssMenu) {
+  try {
+    // Простая валидация URL
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      await ctx.reply('❌ Введите корректный URL, начинающийся с http:// или https://', rssMenu);
+      return;
+    }
+    // Проверяем, что это не YouTube (чтобы не путать)
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      await ctx.reply('❌ Для YouTube используйте кнопку "Добавить YouTube" в отдельном меню.', rssMenu);
+      return;
+    }
+
+    const currentFeeds = await db.getSetting('rss_feeds') || '';
+    const feedsList = currentFeeds ? currentFeeds.split(',') : [];
+    if (feedsList.includes(url)) {
+      await ctx.reply('ℹ️ Эта RSS-лента уже добавлена.', rssMenu);
+      return;
+    }
+
+    feedsList.push(url);
+    await db.setSetting('rss_feeds', feedsList.join(','));
+    // Обновляем newsService
+    await newsService.addFeed(url);
+
+    await ctx.reply(`✅ RSS-лента добавлена:\n${url}`, rssMenu);
+    botLogger.info(`📡 Добавлена RSS-лента: ${url}`);
+  } catch (error) {
+    errorHandler.handleError(error, 'helpers.js: addRssFeed');
+    await ctx.reply('❌ Ошибка при добавлении RSS-ленты. Проверьте логи.', rssMenu);
+  }
+}
+
+async function removeRssFeed(ctx, input, rssMenu) {
+  try {
+    const rssFeeds = await getRssFeeds();
+    if (rssFeeds.length === 0) {
+      await ctx.reply('❌ Нет добавленных RSS-лент для удаления.', rssMenu);
+      return;
+    }
+
+    let feedToRemove = null;
+    const num = parseInt(input);
+    if (!isNaN(num) && num >= 1 && num <= rssFeeds.length) {
+      feedToRemove = rssFeeds[num - 1];
+    } else {
+      feedToRemove = rssFeeds.find(feed => feed === input);
+    }
+
+    if (!feedToRemove) {
+      await ctx.reply(
+        '❌ Лента не найдена. Проверьте номер или введите полный URL.\n\n' +
+        'Используйте "📋 Список RSS", чтобы увидеть доступные ленты.',
+        rssMenu
+      );
+      return;
+    }
+
+    const allFeeds = (await db.getSetting('rss_feeds') || '').split(',').filter(f => f !== '');
+    const updatedFeeds = allFeeds.filter(f => f !== feedToRemove);
+    await updateAllFeeds(updatedFeeds); // используем существующую функцию
+
+    await ctx.reply(`✅ RSS-лента удалена.`, rssMenu);
+    botLogger.info(`🗑️ Удалена RSS-лента: ${feedToRemove}`);
+  } catch (error) {
+    errorHandler.handleError(error, 'helpers.js: removeRssFeed');
+    await ctx.reply('❌ Ошибка при удалении RSS-ленты.', rssMenu);
+  }
+}
+
 // Экспортируем всё, что нужно другим модулям
 module.exports = {
   addChannelSimple,
@@ -267,5 +346,8 @@ module.exports = {
   updateAllFeeds,
   isValidYouTubeUrl,
   handleAddYouTube,
-  handleYouTubeRemove
+  handleYouTubeRemove,
+  getRssFeeds,
+  addRssFeed,
+  removeRssFeed
 };
