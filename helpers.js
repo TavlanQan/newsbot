@@ -188,7 +188,6 @@ async function handleAddYouTube(ctx, input, youtubeMenu) {
         );
         return;
       }
-      // Другие ошибки тоже обработаем
       throw error;
     }
 
@@ -257,23 +256,51 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu) {
   }
 }
 
-// RSS функции (для сайтов)
+// ---------- RSS функции (для сайтов, не YouTube) ----------
 async function getRssFeeds() {
   const currentFeeds = await db.getSetting('rss_feeds') || '';
   const allFeeds = currentFeeds ? currentFeeds.split(',') : [];
   const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
-  // Возвращаем все фиды, кроме YouTube
   return allFeeds.filter(feed => !feed.startsWith(youtubePrefix));
+}
+
+// Новая функция: получает RSS-ленты с меткой "из .env"
+async function getRssFeedsWithMeta() {
+  const dbFeeds = await getRssFeeds();
+  
+  // Получаем начальные ленты из .env
+  const envFeeds = config.RSS_FEEDS ? config.RSS_FEEDS.split(',').filter(f => f.trim()) : [];
+  
+  // Фильтруем только те, что не YouTube
+  const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
+  const envFeedsFiltered = envFeeds.filter(feed => !feed.startsWith(youtubePrefix));
+  
+  // Создаём объект с метками
+  const feedsWithMeta = dbFeeds.map(feed => ({
+    url: feed,
+    fromEnv: envFeedsFiltered.includes(feed)
+  }));
+  
+  // Добавляем ленты из .env, которых нет в БД
+  const dbUrls = new Set(dbFeeds);
+  for (const envFeed of envFeedsFiltered) {
+    if (!dbUrls.has(envFeed)) {
+      feedsWithMeta.push({
+        url: envFeed,
+        fromEnv: true
+      });
+    }
+  }
+  
+  return feedsWithMeta;
 }
 
 async function addRssFeed(ctx, url, rssMenu) {
   try {
-    // Простая валидация URL
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       await ctx.reply('❌ Введите корректный URL, начинающийся с http:// или https://', rssMenu);
       return;
     }
-    // Проверяем, что это не YouTube (чтобы не путать)
     if (url.includes('youtube.com') || url.includes('youtu.be')) {
       await ctx.reply('❌ Для YouTube используйте кнопку "Добавить YouTube" в отдельном меню.', rssMenu);
       return;
@@ -288,7 +315,6 @@ async function addRssFeed(ctx, url, rssMenu) {
 
     feedsList.push(url);
     await db.setSetting('rss_feeds', feedsList.join(','));
-    // Обновляем newsService
     await newsService.addFeed(url);
 
     await ctx.reply(`✅ RSS-лента добавлена:\n${url}`, rssMenu);
@@ -301,18 +327,24 @@ async function addRssFeed(ctx, url, rssMenu) {
 
 async function removeRssFeed(ctx, input, rssMenu) {
   try {
-    const rssFeeds = await getRssFeeds();
-    if (rssFeeds.length === 0) {
+    // Получаем только ленты из БД (не из .env)
+    const dbFeeds = await getRssFeeds();
+    if (dbFeeds.length === 0) {
       await ctx.reply('❌ Нет добавленных RSS-лент для удаления.', rssMenu);
       return;
     }
 
+    // Проверяем, является ли лента системной (из .env)
+    const envFeeds = config.RSS_FEEDS ? config.RSS_FEEDS.split(',').filter(f => f.trim()) : [];
+    const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
+    const envFeedsFiltered = envFeeds.filter(feed => !feed.startsWith(youtubePrefix));
+
     let feedToRemove = null;
     const num = parseInt(input);
-    if (!isNaN(num) && num >= 1 && num <= rssFeeds.length) {
-      feedToRemove = rssFeeds[num - 1];
+    if (!isNaN(num) && num >= 1 && num <= dbFeeds.length) {
+      feedToRemove = dbFeeds[num - 1];
     } else {
-      feedToRemove = rssFeeds.find(feed => feed === input);
+      feedToRemove = dbFeeds.find(feed => feed === input);
     }
 
     if (!feedToRemove) {
@@ -324,9 +356,19 @@ async function removeRssFeed(ctx, input, rssMenu) {
       return;
     }
 
+    // Проверяем, что лента не из .env
+    if (envFeedsFiltered.includes(feedToRemove)) {
+      await ctx.reply(
+        '❌ Нельзя удалить RSS-ленту, добавленную через .env файл.\n\n' +
+        'Эта лента является системной. Чтобы удалить её, отредактируйте .env файл и перезапустите бота.',
+        rssMenu
+      );
+      return;
+    }
+
     const allFeeds = (await db.getSetting('rss_feeds') || '').split(',').filter(f => f !== '');
     const updatedFeeds = allFeeds.filter(f => f !== feedToRemove);
-    await updateAllFeeds(updatedFeeds); // используем существующую функцию
+    await updateAllFeeds(updatedFeeds);
 
     await ctx.reply(`✅ RSS-лента удалена.`, rssMenu);
     botLogger.info(`🗑️ Удалена RSS-лента: ${feedToRemove}`);
@@ -336,7 +378,6 @@ async function removeRssFeed(ctx, input, rssMenu) {
   }
 }
 
-// Экспортируем всё, что нужно другим модулям
 module.exports = {
   addChannelSimple,
   removeChannelSimple,
@@ -348,6 +389,7 @@ module.exports = {
   handleAddYouTube,
   handleYouTubeRemove,
   getRssFeeds,
+  getRssFeedsWithMeta,
   addRssFeed,
   removeRssFeed
 };

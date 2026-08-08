@@ -147,16 +147,39 @@ function registerHandlers(deps) {
 
   bot.hears('📋 Список RSS', async (ctx) => {
     try {
-      const rssFeeds = await helpers.getRssFeeds();
-      if (rssFeeds.length === 0) {
+      const feedsWithMeta = await helpers.getRssFeedsWithMeta();
+      
+      if (feedsWithMeta.length === 0) {
         await ctx.reply('📡 Нет добавленных RSS-лент (кроме YouTube).', rssMenu);
         return;
       }
+      
       let message = '📡 <b>Список RSS-лент:</b>\n\n';
-      rssFeeds.forEach((feed, index) => {
-        message += `${index + 1}. ${feed}\n`;
-      });
-      message += '\nДля удаления используйте кнопку "🗑️ Удалить RSS" и введите номер или URL.';
+      
+      // Сначала показываем ленты из .env
+      const envFeeds = feedsWithMeta.filter(f => f.fromEnv);
+      const dbFeeds = feedsWithMeta.filter(f => !f.fromEnv);
+      
+      if (envFeeds.length > 0) {
+        message += '<i>📌 Системные (из .env):</i>\n';
+        envFeeds.forEach((feed, index) => {
+          message += `${index + 1}. ${feed.url} 🔒\n`;
+        });
+        message += '\n';
+      }
+      
+      if (dbFeeds.length > 0) {
+        message += '<i>📌 Добавленные через бота:</i>\n';
+        dbFeeds.forEach((feed, index) => {
+          const displayIndex = index + 1;
+          message += `${displayIndex}. ${feed.url}\n`;
+        });
+        message += '\n';
+      }
+      
+      message += 'Для удаления используйте кнопку "🗑️ Удалить RSS" и введите номер.';
+      message += '\n🔒 — системные ленты, их нельзя удалить через бота.';
+      
       await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Список RSS"');
