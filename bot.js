@@ -9,10 +9,12 @@ const { botLogger } = require('./utils/logger');
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map(); // Добавляем timestamp для состояний
 
+// Главное меню с новой кнопкой YouTube
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
   ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
-  ['🔄 Запустить пересылку', '⏹️ Остановить пересылку']
+  ['📺 Добавить YouTube', '🔄 Запустить пересылку'],
+  ['⏹️ Остановить пересылку']
 ]).resize();
 
 const keywordsMenu = Markup.keyboard([
@@ -67,7 +69,6 @@ async function sendMessageToTargetChannels(message, options = {}) {
   }
 }
 
-
 async function forwardMessageFromChannel(channelId, messageId) {
   try {
     const targetChannels = await db.getTargetChannels();
@@ -104,7 +105,6 @@ async function forwardMessageFromChannel(channelId, messageId) {
     errorHandler.handleError(error, 'bot.js: forwardMessageFromChannel (outer)');
   }
 }
-
 
 async function addChannelSimple(channelIdentifier, channelType) {
   try {
@@ -196,6 +196,91 @@ async function removeChannelSimple(ctx, userText, type) {
   }
 }
 
+// Новая функция для проверки валидности YouTube ссылки
+function isValidYouTubeUrl(input) {
+  const patterns = [
+    /^https?:\/\/(www\.)?youtube\.com\/@[\w-]+(\/)?$/,
+    /^https?:\/\/(www\.)?youtube\.com\/c\/[\w-]+(\/)?$/,
+    /^https?:\/\/(www\.)?youtube\.com\/channel\/UC[\w-]{22,}(\/)?$/,
+    /^https?:\/\/youtu\.be\/[\w-]+$/,
+    /^https?:\/\/(www\.)?youtube\.com\/watch\?v=[\w-]+$/,
+    /^UC[\w-]{22,}$/
+  ];
+  return patterns.some(pattern => pattern.test(input));
+}
+
+// Новая функция для добавления YouTube канала
+async function handleAddYouTube(ctx, input) {
+  try {
+    // Проверяем, что это похоже на ссылку YouTube
+    if (!isValidYouTubeUrl(input)) {
+      await ctx.reply(
+        '❌ Это не похоже на ссылку YouTube.\n\n' +
+        'Поддерживаются форматы:\n' +
+        '• https://www.youtube.com/@ChannelName\n' +
+        '• https://www.youtube.com/c/ChannelName\n' +
+        '• https://www.youtube.com/channel/UCxxxx\n' +
+        '• https://youtu.be/xxxxxx\n' +
+        '• UCxxxxxxxxxxxxxxxxxxxxx'
+      );
+      return;
+    }
+
+    // Формируем URL для микросервиса
+    const serviceUrl = `${config.YOUTUBE_RSS_SERVICE_URL}?channel=${encodeURIComponent(input)}`;
+    
+    // Проверяем доступность микросервиса
+    try {
+      const axios = require('axios');
+      await axios.get(config.YOUTUBE_RSS_SERVICE_URL, { timeout: 3000 });
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') {
+        await ctx.reply(
+          '❌ Микросервис YouTube-RSS недоступен.\n\n' +
+          'Проверьте:\n' +
+          '• Запущен ли сервис: pm2 status youtube-rss\n' +
+          '• Корректность URL в .env: YOUTUBE_RSS_SERVICE_URL'
+        );
+        return;
+      }
+    }
+
+    // Проверяем, не добавлен ли уже этот канал
+    const currentFeeds = await db.getSetting('rss_feeds');
+    const feedsList = currentFeeds ? currentFeeds.split(',') : [];
+    
+    if (feedsList.includes(serviceUrl)) {
+      await ctx.reply('ℹ️ Этот YouTube канал уже отслеживается.');
+      return;
+    }
+
+    // Добавляем в БД
+    feedsList.push(serviceUrl);
+    await db.setSetting('rss_feeds', feedsList.join(','));
+    
+    // Обновляем в newsService
+    await newsService.addFeed(serviceUrl);
+    
+    await ctx.reply(
+      '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
+      `📡 RSS-ссылка: ${serviceUrl}\n\n` +
+      'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.'
+    );
+    
+    botLogger.info(`📺 Добавлен YouTube канал: ${input} -> ${serviceUrl}`);
+    
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: handleAddYouTube');
+    await ctx.reply(
+      '❌ Произошла ошибка при добавлении канала.\n\n' +
+      'Проверьте:\n' +
+      '• Корректность ссылки\n' +
+      '• Доступность микросервиса YouTube-RSS\n' +
+      '• Логи: pm2 logs youtube-rss'
+    );
+  }
+}
+
 // Функция для безопасного завершения работы
 async function shutdown() {
   botLogger.info('🔴 Завершение работы бота...');
@@ -229,7 +314,11 @@ bot.start(async (ctx) => {
   try {
     await db.initializeDB();
     newsService.setSendFunction(sendMessageToTargetChannels);
-    ctx.reply('👋 Привет! Я бот для мониторинга и пересылки новостей.', mainMenu);
+    ctx.reply(
+      '👋 Привет! Я бот для мониторинга и пересылки новостей.\n\n' +
+      '📺 Чтобы добавить YouTube канал, нажмите кнопку "Добавить YouTube"',
+      mainMenu
+    );
   } catch (error) {
     errorHandler.handleError(error, 'bot.js: bot.start');
     ctx.reply('❌ Ошибка при запуске бота. Проверьте логи.');
@@ -237,6 +326,24 @@ bot.start(async (ctx) => {
 });
 
 bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
+
+// Новая кнопка "Добавить YouTube"
+bot.hears('📺 Добавить YouTube', (ctx) => {
+  userStates.set(ctx.from.id, { 
+    state: 'waiting_for_youtube_link', 
+    timestamp: Date.now() 
+  });
+  ctx.reply(
+    '📺 Отправьте ссылку на YouTube канал\n\n' +
+    'Поддерживаются форматы:\n' +
+    '• https://www.youtube.com/@ChannelName\n' +
+    '• https://www.youtube.com/c/ChannelName\n' +
+    '• https://www.youtube.com/channel/UCxxxx\n' +
+    '• https://youtu.be/xxxxxx\n' +
+    '• UCxxxxxxxxxxxxxxxxxxxxx\n\n' +
+    'Отправьте "Отмена", чтобы отменить действие.'
+  );
+});
 
 bot.hears('🔄 Запустить пересылку', async (ctx) => {
   try {
@@ -407,6 +514,20 @@ bot.on('message', async (ctx) => {
   if (!text || (ctx.message.chat && ctx.message.chat.type === 'channel')) return;
 
   try {
+    // Обработка отмены для всех состояний
+    if (text.toLowerCase() === 'отмена' && state) {
+      userStates.delete(userId);
+      ctx.reply('❌ Действие отменено. Возвращаюсь в главное меню.', mainMenu);
+      return;
+    }
+
+    // Новая обработка для YouTube
+    if (state === 'waiting_for_youtube_link') {
+      await handleAddYouTube(ctx, text);
+      userStates.delete(userId);
+      return;
+    }
+
     if (state === 'waiting_for_keyword_add') {
       const added = await db.addKeyword(text);
       userStates.delete(userId);
