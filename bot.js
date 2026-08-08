@@ -9,12 +9,12 @@ const { botLogger } = require('./utils/logger');
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map(); // Добавляем timestamp для состояний
 
-// Главное меню с новой кнопкой YouTube
+// Обновлённое главное меню с новыми кнопками YouTube
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
   ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
-  ['📺 Добавить YouTube', '🔄 Запустить пересылку'],
-  ['⏹️ Остановить пересылку']
+  ['📺 Добавить YouTube', '📋 Список YouTube', '🗑️ Удалить YouTube'],
+  ['🔄 Запустить пересылку', '⏹️ Остановить пересылку']
 ]).resize();
 
 const keywordsMenu = Markup.keyboard([
@@ -33,6 +33,26 @@ const monitoredChannelsMenu = Markup.keyboard([
 ]).resize();
 
 let isForwardingActive = false;
+
+// --- Вспомогательные функции для YouTube ---
+
+// Получить массив YouTube-ссылок (фидов, которые используют микросервис)
+async function getYouTubeFeeds() {
+  const currentFeeds = await db.getSetting('rss_feeds') || '';
+  const allFeeds = currentFeeds ? currentFeeds.split(',') : [];
+  const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
+  return allFeeds.filter(feed => feed.startsWith(youtubePrefix));
+}
+
+// Обновить список всех фидов (замена существующего списка)
+async function updateAllFeeds(newFeedsArray) {
+  const feedsString = newFeedsArray.join(',');
+  await db.setSetting('rss_feeds', feedsString);
+  // Также обновляем в newsService (передаём полный список)
+  await newsService.setFeeds(newFeedsArray);
+}
+
+// --- Функции отправки и пересылки ---
 
 async function sendMessageToTargetChannels(message, options = {}) {
   try {
@@ -106,9 +126,10 @@ async function forwardMessageFromChannel(channelId, messageId) {
   }
 }
 
+// --- Управление каналами (общее) ---
+
 async function addChannelSimple(channelIdentifier, channelType) {
   try {
-    // Валидация ID канала
     if (!channelIdentifier || typeof channelIdentifier !== 'string') {
       return {
         success: false,
@@ -116,7 +137,6 @@ async function addChannelSimple(channelIdentifier, channelType) {
       };
     }
 
-    // Проверка формата ID канала (Telegram channel IDs обычно начинаются с -100)
     if (channelIdentifier.startsWith('-') && !channelIdentifier.startsWith('-100')) {
       return {
         success: false,
@@ -196,7 +216,8 @@ async function removeChannelSimple(ctx, userText, type) {
   }
 }
 
-// Новая функция для проверки валидности YouTube ссылки
+// --- YouTube специфичные функции ---
+
 function isValidYouTubeUrl(input) {
   const patterns = [
     /^https?:\/\/(www\.)?youtube\.com\/@[\w-]+(\/)?$/,
@@ -209,10 +230,8 @@ function isValidYouTubeUrl(input) {
   return patterns.some(pattern => pattern.test(input));
 }
 
-// Новая функция для добавления YouTube канала
 async function handleAddYouTube(ctx, input) {
   try {
-    // Проверяем, что это похоже на ссылку YouTube
     if (!isValidYouTubeUrl(input)) {
       await ctx.reply(
         '❌ Это не похоже на ссылку YouTube.\n\n' +
@@ -226,10 +245,9 @@ async function handleAddYouTube(ctx, input) {
       return;
     }
 
-    // Формируем URL для микросервиса
     const serviceUrl = `${config.YOUTUBE_RSS_SERVICE_URL}?channel=${encodeURIComponent(input)}`;
     
-    // Проверяем доступность микросервиса
+    // Проверка доступности микросервиса
     try {
       const axios = require('axios');
       await axios.get(config.YOUTUBE_RSS_SERVICE_URL, { timeout: 3000 });
@@ -245,8 +263,7 @@ async function handleAddYouTube(ctx, input) {
       }
     }
 
-    // Проверяем, не добавлен ли уже этот канал
-    const currentFeeds = await db.getSetting('rss_feeds');
+    const currentFeeds = await db.getSetting('rss_feeds') || '';
     const feedsList = currentFeeds ? currentFeeds.split(',') : [];
     
     if (feedsList.includes(serviceUrl)) {
@@ -254,11 +271,8 @@ async function handleAddYouTube(ctx, input) {
       return;
     }
 
-    // Добавляем в БД
     feedsList.push(serviceUrl);
     await db.setSetting('rss_feeds', feedsList.join(','));
-    
-    // Обновляем в newsService
     await newsService.addFeed(serviceUrl);
     
     await ctx.reply(
@@ -281,7 +295,54 @@ async function handleAddYouTube(ctx, input) {
   }
 }
 
-// Функция для безопасного завершения работы
+async function handleYouTubeRemove(ctx, input) {
+  try {
+    const youtubeFeeds = await getYouTubeFeeds();
+    if (youtubeFeeds.length === 0) {
+      ctx.reply('❌ Нет YouTube-каналов для удаления.', mainMenu);
+      return;
+    }
+
+    let feedToRemove = null;
+    let indexToRemove = -1;
+
+    // Пытаемся интерпретировать ввод как номер
+    const num = parseInt(input);
+    if (!isNaN(num) && num >= 1 && num <= youtubeFeeds.length) {
+      indexToRemove = num - 1;
+      feedToRemove = youtubeFeeds[indexToRemove];
+    } else {
+      // Или как полную ссылку
+      const found = youtubeFeeds.find(feed => feed === input);
+      if (found) {
+        feedToRemove = found;
+        indexToRemove = youtubeFeeds.indexOf(found);
+      }
+    }
+
+    if (!feedToRemove) {
+      ctx.reply(
+        '❌ Канал не найден. Проверьте номер или введите полную RSS-ссылку.\n\n' +
+        'Используйте "📋 Список YouTube", чтобы увидеть доступные каналы.'
+      );
+      return;
+    }
+
+    // Удаляем из списка
+    const allFeeds = (await db.getSetting('rss_feeds') || '').split(',').filter(f => f !== '');
+    const updatedFeeds = allFeeds.filter(f => f !== feedToRemove);
+    await updateAllFeeds(updatedFeeds);
+
+    ctx.reply(`✅ YouTube-канал удалён.`, mainMenu);
+    botLogger.info(`🗑️ Удалён YouTube канал: ${feedToRemove}`);
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: handleYouTubeRemove');
+    ctx.reply('❌ Ошибка при удалении YouTube-канала.');
+  }
+}
+
+// --- Функция завершения ---
+
 async function shutdown() {
   botLogger.info('🔴 Завершение работы бота...');
   try {
@@ -293,7 +354,8 @@ async function shutdown() {
   }
 }
 
-// Таймаут для состояний пользователя (очистка каждые 5 минут)
+// --- Очистка состояний ---
+
 setInterval(() => {
   const now = Date.now();
   let clearedCount = 0;
@@ -308,7 +370,9 @@ setInterval(() => {
   if (clearedCount > 0) {
     botLogger.info(`🧹 Очищено ${clearedCount} устаревших состояний пользователей`);
   }
-}, 5 * 60 * 1000); // Проверка каждые 5 минут
+}, 5 * 60 * 1000);
+
+// --- Команды и кнопки ---
 
 bot.start(async (ctx) => {
   try {
@@ -316,7 +380,7 @@ bot.start(async (ctx) => {
     newsService.setSendFunction(sendMessageToTargetChannels);
     ctx.reply(
       '👋 Привет! Я бот для мониторинга и пересылки новостей.\n\n' +
-      '📺 Чтобы добавить YouTube канал, нажмите кнопку "Добавить YouTube"',
+      '📺 Управляйте YouTube каналами через кнопки в меню.',
       mainMenu
     );
   } catch (error) {
@@ -327,7 +391,8 @@ bot.start(async (ctx) => {
 
 bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
 
-// Новая кнопка "Добавить YouTube"
+// --- YouTube управление ---
+
 bot.hears('📺 Добавить YouTube', (ctx) => {
   userStates.set(ctx.from.id, { 
     state: 'waiting_for_youtube_link', 
@@ -344,6 +409,49 @@ bot.hears('📺 Добавить YouTube', (ctx) => {
     'Отправьте "Отмена", чтобы отменить действие.'
   );
 });
+
+bot.hears('📋 Список YouTube', async (ctx) => {
+  try {
+    const youtubeFeeds = await getYouTubeFeeds();
+    if (youtubeFeeds.length === 0) {
+      ctx.reply('📺 Нет добавленных YouTube-каналов.', mainMenu);
+      return;
+    }
+
+    let message = '📋 <b>Список YouTube-каналов:</b>\n\n';
+    youtubeFeeds.forEach((feed, index) => {
+      // Извлекаем параметр channel из URL для красоты
+      try {
+        const url = new URL(feed);
+        const channelParam = url.searchParams.get('channel') || feed;
+        message += `${index + 1}. ${channelParam}\n`;
+      } catch {
+        message += `${index + 1}. ${feed}\n`;
+      }
+    });
+    message += '\nДля удаления используйте кнопку "🗑️ Удалить YouTube" и введите номер канала.';
+
+    ctx.reply(message, { parse_mode: 'HTML' });
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: hears "Список YouTube"');
+    ctx.reply('❌ Ошибка при получении списка YouTube-каналов.');
+  }
+});
+
+bot.hears('🗑️ Удалить YouTube', (ctx) => {
+  userStates.set(ctx.from.id, {
+    state: 'waiting_for_youtube_remove',
+    timestamp: Date.now()
+  });
+  ctx.reply(
+    '🗑️ Введите номер YouTube-канала для удаления.\n\n' +
+    'Сначала посмотрите список командой "📋 Список YouTube".\n' +
+    'Или введите полную RSS-ссылку.\n\n' +
+    'Отправьте "Отмена", чтобы отменить действие.'
+  );
+});
+
+// --- Основные функции бота ---
 
 bot.hears('🔄 Запустить пересылку', async (ctx) => {
   try {
@@ -481,6 +589,8 @@ bot.hears('📈 Статистика', async (ctx) => {
   }
 });
 
+// --- Обработка channel_post ---
+
 bot.on('channel_post', async (ctx) => {
   if (!isForwardingActive) return;
 
@@ -505,6 +615,8 @@ bot.on('channel_post', async (ctx) => {
   }
 });
 
+// --- Обработка текстовых сообщений ---
+
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   const stateData = userStates.get(userId);
@@ -521,9 +633,15 @@ bot.on('message', async (ctx) => {
       return;
     }
 
-    // Новая обработка для YouTube
+    // Состояния
     if (state === 'waiting_for_youtube_link') {
       await handleAddYouTube(ctx, text);
+      userStates.delete(userId);
+      return;
+    }
+
+    if (state === 'waiting_for_youtube_remove') {
+      await handleYouTubeRemove(ctx, text);
       userStates.delete(userId);
       return;
     }
@@ -584,11 +702,12 @@ bot.on('message', async (ctx) => {
   }
 });
 
+// --- Запуск бота ---
+
 async function startBot() {
   try {
     botLogger.info('🚀 Запуск бота...');
     
-    // Инициализация БД с повторными попытками
     let dbInitialized = false;
     let attempts = 0;
     while (!dbInitialized && attempts < 3) {
@@ -623,7 +742,8 @@ async function startBot() {
   }
 }
 
-// Глобальные обработчики с использованием errorHandler
+// --- Глобальные обработчики ---
+
 process.on('unhandledRejection', (reason) => {
   errorHandler.handleError(reason, 'GLOBAL: unhandledRejection');
 });
