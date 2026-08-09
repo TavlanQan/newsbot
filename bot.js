@@ -6,7 +6,7 @@ const queue = require('./queue');
 const errorHandler = require('./errorHandler');
 const { botLogger } = require('./utils/logger');
 const helpers = require('./helpers');
-const registerHandlers = require('./handlers');
+const { registerHandlers } = require('./handlers');
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
