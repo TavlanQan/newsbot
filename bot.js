@@ -1,16 +1,76 @@
 const { Telegraf } = require('telegraf');
+const cron = require('node-cron');
 const db = require('./db');
 const config = require('./config');
 const newsService = require('./newsService');
-const queue = require('./queue');
-const errorHandler = require('./errorHandler');
 const { botLogger } = require('./utils/logger');
-const helpers = require('./helpers');
+const errorHandler = require('./errorHandler');
 const { registerHandlers } = require('./handlers');
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 const isForwardingActive = { value: false };
+
+// ---------- Инициализация БД (создание таблиц) ----------
+async function initDatabase() {
+  const sqlite3 = require('sqlite3').verbose();
+  const dbFile = config.DB_PATH || './news_bot.db';
+  const dbLocal = new sqlite3.Database(dbFile);
+  dbLocal.run('PRAGMA journal_mode = WAL;');
+
+  const queries = [
+    `CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        subscription_end INTEGER,
+        is_admin INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+    );`,
+    `CREATE TABLE IF NOT EXISTS keywords (
+        user_id INTEGER,
+        keyword TEXT,
+        PRIMARY KEY (user_id, keyword)
+    );`,
+    `CREATE TABLE IF NOT EXISTS monitored_channels (
+        user_id INTEGER,
+        channel_id TEXT,
+        channel_username TEXT,
+        channel_title TEXT,
+        PRIMARY KEY (user_id, channel_id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS target_channels (
+        user_id INTEGER,
+        channel_id TEXT,
+        channel_username TEXT,
+        channel_title TEXT,
+        PRIMARY KEY (user_id, channel_id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS user_feeds (
+        user_id INTEGER,
+        feed_url TEXT,
+        PRIMARY KEY (user_id, feed_url)
+    );`,
+    `CREATE TABLE IF NOT EXISTS forwarded_messages (
+        message_id INTEGER,
+        channel_id TEXT,
+        timestamp INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (message_id, channel_id)
+    );`
+  ];
+
+  for (const sql of queries) {
+    await new Promise((resolve, reject) => {
+      dbLocal.run(sql, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  dbLocal.close((err) => {
+    if (err) botLogger.error(`Ошибка закрытия БД: ${err.message}`);
+    else botLogger.info('✅ База данных инициализирована (таблицы созданы)');
+  });
+}
 
 // ---------- Функция завершения ----------
 async function shutdown() {
@@ -24,12 +84,13 @@ async function shutdown() {
   }
 }
 
-// Очистка устаревших состояний
+// Очистка устаревших состояний (каждые 5 минут)
 setInterval(() => {
   const now = Date.now();
   let clearedCount = 0;
   for (const [userId, stateData] of userStates.entries()) {
-    if (now - stateData.timestamp > 30 * 60 * 1000) {
+    const timestamp = stateData.timestamp || stateData;
+    if (now - timestamp > 30 * 60 * 1000) {
       userStates.delete(userId);
       clearedCount++;
     }
@@ -40,48 +101,35 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // Регистрируем все обработчики
-registerHandlers({
-  bot,
-  db,
-  config,
-  newsService,
-  queue,
-  errorHandler,
-  logger: { botLogger },
-  userStates,
-  isForwardingActive,
-  helpers
-});
+registerHandlers({ bot, userStates, isForwardingActive });
 
 // ---------- Запуск бота ----------
 async function startBot() {
   try {
     botLogger.info('🚀 Запуск бота...');
-    let dbInitialized = false;
-    let attempts = 0;
-    while (!dbInitialized && attempts < 3) {
-      try {
-        await db.initializeDB();
-        dbInitialized = true;
-        botLogger.info('✅ База данных инициализирована');
-      } catch (error) {
-        attempts++;
-        errorHandler.handleError(error, `bot.js: startBot (DB init attempt ${attempts})`);
-        botLogger.warn(`⚠️ Попытка инициализации БД #${attempts} не удалась`);
-        if (attempts < 3) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-    }
-    if (!dbInitialized) {
-      botLogger.error('❌ Не удалось инициализировать БД после 3 попыток. Завершаем работу.');
-      process.exit(1);
-    }
-    await newsService.initialize();
+    await initDatabase();
+
     await bot.launch();
     botLogger.info('✅ Бот запущен и готов к работе.');
-    newsService.setSendFunction((msg, opts) => helpers.sendMessageToTargetChannels(bot, msg, opts));
-    botLogger.info('✅ Функция отправки установлена');
+
+    const intervalMinutes = config.RSS_UPDATE_INTERVAL || 10;
+    cron.schedule(`*/${intervalMinutes} * * * *`, async () => {
+      if (isForwardingActive.value) {
+        botLogger.info('🔄 Периодическая проверка RSS...');
+        await newsService.checkAllFeeds(bot);
+      } else {
+        botLogger.info('⏸️ Мониторинг остановлен, RSS не проверяется');
+      }
+    });
+
+    setTimeout(async () => {
+      if (isForwardingActive.value) {
+        botLogger.info('🔄 Первая проверка RSS после запуска...');
+        await newsService.checkAllFeeds(bot);
+      }
+    }, 5000);
+
+    botLogger.info(`✅ Мониторинг RSS настроен с интервалом ${intervalMinutes} мин`);
   } catch (error) {
     errorHandler.handleError(error, 'bot.js: startBot (outer)');
     botLogger.error('❌ Критическая ошибка при запуске бота. Завершаем работу.');
@@ -89,7 +137,7 @@ async function startBot() {
   }
 }
 
-// Глобальные обработчики
+// Глобальные обработчики ошибок
 process.on('unhandledRejection', (reason) => {
   errorHandler.handleError(reason, 'GLOBAL: unhandledRejection');
 });
