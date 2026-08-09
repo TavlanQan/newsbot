@@ -1,7 +1,12 @@
 // handlers.js
 const { Markup } = require('telegraf');
+const db = require('./db');
+const helpers = require('./helpers');
+const config = require('./config');
+const { botLogger } = require('./utils/logger');
+const errorHandler = require('./errorHandler');
 
-// Клавиатуры
+// ---------- Клавиатуры (обычные, не inline) ----------
 const mainMenu = Markup.keyboard([
   ['📈 Статистика', '🗝️ Ключевые слова'],
   ['🎯 Целевые каналы', '📡 Мониторинг каналов'],
@@ -34,52 +39,140 @@ const monitoredChannelsMenu = Markup.keyboard([
   ['⬅️ Назад']
 ]).resize();
 
+// ---------- Админ-меню (inline) ----------
+const adminMenu = Markup.inlineKeyboard([
+  [Markup.button.callback('📋 Список пользователей', 'admin_list')],
+  [Markup.button.callback('➕ Добавить подписку', 'admin_add_sub')],
+  [Markup.button.callback('➖ Удалить пользователя', 'admin_remove_user')],
+  [Markup.button.callback('🔙 Закрыть админ-панель', 'admin_close')]
+]);
+
+// ---------- Вспомогательные функции ----------
+async function ensureUser(ctx) {
+  const userId = ctx.from.id;
+  let user = await db.getUser(userId);
+  if (!user) {
+    // Пробный период 7 дней
+    const trialEnd = Math.floor(Date.now() / 1000) + 7 * 86400;
+    await db.addUser(userId, false, trialEnd);
+    user = await db.getUser(userId);
+    await ctx.reply(
+      '🎉 Добро пожаловать! Вам предоставлен бесплатный пробный период на 7 дней.\n' +
+      'Для продления обратитесь к администратору.'
+    );
+  }
+  const hasSub = await db.hasActiveSubscription(userId);
+  if (!hasSub) {
+    await ctx.reply(
+      '⛔ Ваша подписка истекла. Для продолжения работы обратитесь к администратору для продления.',
+      mainMenu
+    );
+    return false;
+  }
+  return true;
+}
+
+async function isAdmin(userId) {
+  const user = await db.getUser(userId);
+  return user && user.is_admin === 1;
+}
+
+// ---------- Регистрация обработчиков ----------
 function registerHandlers(deps) {
-  const {
-    bot,
-    db,
-    config,
-    newsService,
-    queue,
-    errorHandler,
-    logger,
-    userStates,
-    isForwardingActive,
-    helpers
-  } = deps;
+  const { bot, userStates, isForwardingActive } = deps;
 
-  const { botLogger } = logger;
-
-  // ---------- Команды ----------
+  // ---------- Команда /start ----------
   bot.start(async (ctx) => {
-    try {
-      await db.initializeDB();
-      newsService.setSendFunction((msg, opts) => helpers.sendMessageToTargetChannels(bot, msg, opts));
-      await ctx.reply(
-        '👋 Привет! Я бот для мониторинга и пересылки новостей.\n\n' +
-        'Используйте кнопки меню для управления.',
-        mainMenu
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    await ctx.reply(
+      '👋 Привет! Я бот для мониторинга и пересылки новостей.\n\n' +
+      'Используйте кнопки меню для управления.',
+      mainMenu
+    );
+  });
+
+  // ---------- Команда /admin (только для админов) ----------
+  bot.command('admin', async (ctx) => {
+    const userId = ctx.from.id;
+    if (!(await isAdmin(userId))) {
+      await ctx.reply('⛔ У вас нет прав администратора.');
+      return;
+    }
+    await ctx.reply('👑 Админ-панель', adminMenu);
+  });
+
+  // ---------- Обработка inline-кнопок админ-меню ----------
+  bot.action(/admin_.*/, async (ctx) => {
+    const userId = ctx.from.id;
+    if (!(await isAdmin(userId))) {
+      await ctx.answerCbQuery('⛔ Нет прав');
+      return;
+    }
+    await ctx.answerCbQuery();
+
+    const data = ctx.callbackQuery.data;
+
+    if (data === 'admin_list') {
+      const users = await db.listUsers();
+      let msg = '👥 <b>Список пользователей</b>\n\n';
+      for (const u of users) {
+        const sub = u.subscription_end
+          ? new Date(u.subscription_end * 1000).toLocaleDateString()
+          : 'бессрочно';
+        msg += `ID: <code>${u.user_id}</code>, подписка до: ${sub}, админ: ${u.is_admin ? '✅' : '❌'}\n`;
+      }
+      await ctx.editMessageText(msg, { parse_mode: 'HTML', ...adminMenu });
+      return;
+    }
+
+    if (data === 'admin_add_sub') {
+      await ctx.editMessageText(
+        '✏️ Введите ID пользователя и количество дней через пробел.\n' +
+        'Пример: <code>123456789 30</code>',
+        { parse_mode: 'HTML', ...adminMenu }
       );
-    } catch (error) {
-      errorHandler.handleError(error, 'handlers.js: bot.start');
-      await ctx.reply('❌ Ошибка при запуске бота. Проверьте логи.');
+      userStates.set(userId, { state: 'admin_waiting_add_sub' });
+      return;
+    }
+
+    if (data === 'admin_remove_user') {
+      await ctx.editMessageText(
+        '✏️ Введите ID пользователя для удаления.\n' +
+        'Пример: <code>123456789</code>',
+        { parse_mode: 'HTML', ...adminMenu }
+      );
+      userStates.set(userId, { state: 'admin_waiting_remove_user' });
+      return;
+    }
+
+    if (data === 'admin_close') {
+      await ctx.deleteMessage();
+      await ctx.reply('🏠 Главное меню', mainMenu);
+      return;
     }
   });
 
   // ---------- Назад в главное меню ----------
-  bot.hears('⬅️ Назад', (ctx) => ctx.reply('🏠 Главное меню', mainMenu));
-
-  // ---------- YouTube подменю ----------
-  bot.hears('📺 YouTube каналы', (ctx) => {
-    ctx.reply('📺 Управление YouTube каналами:', youtubeMenu);
+  bot.hears('⬅️ Назад', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    await ctx.reply('🏠 Главное меню', mainMenu);
   });
 
-  bot.hears('📺 Добавить YouTube', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_youtube_link',
-      timestamp: Date.now()
-    });
-    ctx.reply(
+  // ---------- YouTube подменю ----------
+  bot.hears('📺 YouTube каналы', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    await ctx.reply('📺 Управление YouTube каналами:', youtubeMenu);
+  });
+
+  bot.hears('📺 Добавить YouTube', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_youtube_link' });
+    await ctx.reply(
       '📺 Отправьте ссылку на YouTube канал\n\n' +
       'Поддерживаются форматы:\n' +
       '• https://www.youtube.com/@ChannelName\n' +
@@ -92,8 +185,11 @@ function registerHandlers(deps) {
   });
 
   bot.hears('📋 Список YouTube', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const youtubeFeeds = await helpers.getYouTubeFeeds();
+      const youtubeFeeds = await helpers.getYouTubeFeeds(userId);
       if (youtubeFeeds.length === 0) {
         await ctx.reply('📺 Нет добавленных YouTube-каналов.', youtubeMenu);
         return;
@@ -116,12 +212,12 @@ function registerHandlers(deps) {
     }
   });
 
-  bot.hears('🗑️ Удалить YouTube', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_youtube_remove',
-      timestamp: Date.now()
-    });
-    ctx.reply(
+  bot.hears('🗑️ Удалить YouTube', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_youtube_remove' });
+    await ctx.reply(
       '🗑️ Введите номер YouTube-канала для удаления.\n\n' +
       'Сначала посмотрите список командой "📋 Список YouTube".\n' +
       'Или введите полную RSS-ссылку.\n\n' +
@@ -130,56 +226,38 @@ function registerHandlers(deps) {
   });
 
   // ---------- RSS подменю ----------
-  bot.hears('📡 RSS ленты', (ctx) => {
-    ctx.reply('📡 Управление RSS-лентами сторонних сайтов:', rssMenu);
+  bot.hears('📡 RSS ленты', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    await ctx.reply('📡 Управление RSS-лентами сторонних сайтов:', rssMenu);
   });
 
-  bot.hears('➕ Добавить RSS', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_rss_add',
-      timestamp: Date.now()
-    });
-    ctx.reply(
+  bot.hears('➕ Добавить RSS', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_rss_add' });
+    await ctx.reply(
       '📡 Введите URL RSS-ленты сайта (например, https://example.com/rss.xml).\n\n' +
       'Отправьте "Отмена", чтобы отменить действие.'
     );
   });
 
   bot.hears('📋 Список RSS', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const feedsWithMeta = await helpers.getRssFeedsWithMeta();
-      
+      const feedsWithMeta = await helpers.getRssFeedsWithMeta(userId);
       if (feedsWithMeta.length === 0) {
         await ctx.reply('📡 Нет добавленных RSS-лент (кроме YouTube).', rssMenu);
         return;
       }
-      
-      let message = '📡 <b>Список RSS-лент:</b>\n\n';
-      
-      // Сначала показываем ленты из .env
-      const envFeeds = feedsWithMeta.filter(f => f.fromEnv);
-      const dbFeeds = feedsWithMeta.filter(f => !f.fromEnv);
-      
-      if (envFeeds.length > 0) {
-        message += '<i>📌 Системные (из .env):</i>\n';
-        envFeeds.forEach((feed, index) => {
-          message += `${index + 1}. ${feed.url} 🔒\n`;
-        });
-        message += '\n';
-      }
-      
-      if (dbFeeds.length > 0) {
-        message += '<i>📌 Добавленные через бота:</i>\n';
-        dbFeeds.forEach((feed, index) => {
-          const displayIndex = index + 1;
-          message += `${displayIndex}. ${feed.url}\n`;
-        });
-        message += '\n';
-      }
-      
-      message += 'Для удаления используйте кнопку "🗑️ Удалить RSS" и введите номер.';
-      message += '\n🔒 — системные ленты, их нельзя удалить через бота.';
-      
+      let message = '📡 <b>Ваши RSS-ленты:</b>\n\n';
+      feedsWithMeta.forEach((item, index) => {
+        message += `${index + 1}. ${item.url}\n`;
+      });
+      message += '\nДля удаления используйте кнопку "🗑️ Удалить RSS" и введите номер.';
       await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Список RSS"');
@@ -187,24 +265,24 @@ function registerHandlers(deps) {
     }
   });
 
-  bot.hears('🗑️ Удалить RSS', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_rss_remove',
-      timestamp: Date.now()
-    });
-    ctx.reply(
+  bot.hears('🗑️ Удалить RSS', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_rss_remove' });
+    await ctx.reply(
       '🗑️ Введите номер или полный URL RSS-ленты для удаления.\n\n' +
       'Сначала посмотрите список командой "📋 Список RSS".\n' +
       'Отправьте "Отмена", чтобы отменить действие.'
     );
   });
 
-  // ---------- Основные функции ----------
+  // ---------- Основные функции: запуск/остановка пересылки ----------
   bot.hears('🔄 Запустить пересылку', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
     try {
       isForwardingActive.value = true;
-      newsService.setSendFunction((msg, opts) => helpers.sendMessageToTargetChannels(bot, msg, opts));
-      await newsService.startMonitoring();
       await ctx.reply('✅ Пересылка сообщений активирована!', mainMenu);
       botLogger.info('🔄 Пересылка сообщений активирована пользователем');
     } catch (error) {
@@ -214,9 +292,10 @@ function registerHandlers(deps) {
   });
 
   bot.hears('⏹️ Остановить пересылку', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
     try {
       isForwardingActive.value = false;
-      await newsService.stopMonitoring();
       await ctx.reply('⏹️ Пересылка сообщений остановлена!', mainMenu);
       botLogger.info('⏹️ Пересылка сообщений остановлена пользователем');
     } catch (error) {
@@ -227,8 +306,11 @@ function registerHandlers(deps) {
 
   // ---------- Ключевые слова ----------
   bot.hears('🗝️ Ключевые слова', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const keywords = await db.getKeywords();
+      const keywords = await db.getKeywords(userId);
       const list = keywords.length ? keywords.map(k => `🔹 ${k}`).join('\n') : '— нет —';
       await ctx.reply(`📜 Текущие ключевые слова:\n${list}`, keywordsMenu);
     } catch (error) {
@@ -237,109 +319,121 @@ function registerHandlers(deps) {
     }
   });
 
-  bot.hears('➕ Добавить ключевое слово', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_keyword_add',
-      timestamp: Date.now()
-    });
-    ctx.reply('✏️ Введите ключевое слово для добавления:');
+  bot.hears('➕ Добавить ключевое слово', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_keyword_add' });
+    await ctx.reply('✏️ Введите ключевое слово для добавления:');
   });
 
-  bot.hears('🗑️ Удалить ключевое слово', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_keyword_remove',
-      timestamp: Date.now()
-    });
-    ctx.reply('🗑️ Введите ключевое слово для удаления:');
+  bot.hears('🗑️ Удалить ключевое слово', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_keyword_remove' });
+    await ctx.reply('🗑️ Введите ключевое слово для удаления:');
   });
 
   // ---------- Целевые каналы ----------
   bot.hears('🎯 Целевые каналы', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const channels = await db.getTargetChannels();
+      const channels = await db.getTargetChannels(userId);
       const list = channels.length
         ? channels.map(c => `🔹 ${c.channel_id} (${c.channel_title || 'без названия'})`).join('\n')
         : '— нет —';
-      await ctx.reply(`🎯 Целевые каналы:\n${list}`, targetChannelsMenu);
+      await ctx.reply(`🎯 Ваши целевые каналы:\n${list}`, targetChannelsMenu);
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Целевые каналы"');
       await ctx.reply('❌ Ошибка при получении целевых каналов.', mainMenu);
     }
   });
 
-  bot.hears('➕ Добавить целевой канал', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_target_channel_add',
-      timestamp: Date.now()
-    });
-    ctx.reply('✏️ Введите ID целевого канала (например: -1001234567890):');
+  bot.hears('➕ Добавить целевой канал', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_target_channel_add' });
+    await ctx.reply('✏️ Введите ID целевого канала (например: -1001234567890):');
   });
 
-  bot.hears('🗑️ Удалить целевой канал', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_target_channel_remove',
-      timestamp: Date.now()
-    });
-    ctx.reply('🗑️ Введите ID целевого канала для удаления:');
+  bot.hears('🗑️ Удалить целевой канал', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_target_channel_remove' });
+    await ctx.reply('🗑️ Введите ID целевого канала для удаления:');
   });
 
   // ---------- Мониторинг каналов ----------
   bot.hears('📡 Мониторинг каналов', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const channels = await db.getMonitoredChannels();
+      const channels = await db.getMonitoredChannels(userId);
       const list = channels.length
         ? channels.map(c => `🔹 ${c.channel_id} (${c.channel_title || 'без названия'})`).join('\n')
         : '— нет —';
-      await ctx.reply(`📡 Отслеживаемые каналы:\n${list}`, monitoredChannelsMenu);
+      await ctx.reply(`📡 Ваши отслеживаемые каналы:\n${list}`, monitoredChannelsMenu);
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Мониторинг каналов"');
       await ctx.reply('❌ Ошибка при получении отслеживаемых каналов.', mainMenu);
     }
   });
 
-  bot.hears('➕ Добавить отслеживаемый канал', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_monitored_channel_add',
-      timestamp: Date.now()
-    });
-    ctx.reply('✏️ Введите ID канала для отслеживания (например: -1001234567890):');
+  bot.hears('➕ Добавить отслеживаемый канал', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_monitored_channel_add' });
+    await ctx.reply('✏️ Введите ID канала для отслеживания (например: -1001234567890):');
   });
 
-  bot.hears('🗑️ Удалить отслеживаемый канал', (ctx) => {
-    userStates.set(ctx.from.id, {
-      state: 'waiting_for_monitored_channel_remove',
-      timestamp: Date.now()
-    });
-    ctx.reply('🗑️ Введите ID отслеживаемого канала для удаления:');
+  bot.hears('🗑️ Удалить отслеживаемый канал', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    userStates.set(userId, { state: 'waiting_for_monitored_channel_remove' });
+    await ctx.reply('🗑️ Введите ID отслеживаемого канала для удаления:');
   });
 
   // ---------- Статистика ----------
   bot.hears('📈 Статистика', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
     try {
-      const keywordsCount = (await db.getKeywords()).length;
-      const targetChannelsCount = (await db.getTargetChannels()).length;
-      const monitoredChannelsCount = (await db.getMonitoredChannels()).length;
-      const forwardedCount = await db.countForwardedMessages();
-      const sentNewsCount = await db.countSentNews();
+      const keywords = await db.getKeywords(userId);
+      const targets = await db.getTargetChannels(userId);
+      const monitored = await db.getMonitoredChannels(userId);
+      const feeds = await db.getUserFeeds(userId);
+      const user = await db.getUser(userId);
+      const subEnd = user.subscription_end
+        ? new Date(user.subscription_end * 1000).toLocaleDateString()
+        : 'бессрочно';
 
       const msg = `
-📊 Статистика бота:
+📊 <b>Ваша статистика</b>
 
-🗝️ Ключевых слов: ${keywordsCount}
-🎯 Целевых каналов: ${targetChannelsCount}
-📡 Отслеживаемых каналов: ${monitoredChannelsCount}
-📤 Пересланных сообщений: ${forwardedCount}
-📰 Отправленных новостей: ${sentNewsCount}
+🗝️ Ключевых слов: ${keywords.length}
+🎯 Целевых каналов: ${targets.length}
+📡 Отслеживаемых каналов: ${monitored.length}
+📡 RSS/YouTube лент: ${feeds.length}
+⏳ Подписка до: ${subEnd}
 🔄 Пересылка: ${isForwardingActive.value ? '✅ Активна' : '❌ Остановлена'}
       `;
-      await ctx.reply(msg, mainMenu);
+      await ctx.reply(msg, { parse_mode: 'HTML', ...mainMenu });
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Статистика"');
       await ctx.reply('❌ Ошибка при получении статистики.', mainMenu);
     }
   });
 
-  // ---------- Обработка channel_post ----------
+  // ---------- Обработка channel_post (пересылка из каналов) ----------
   bot.on('channel_post', async (ctx) => {
     if (!isForwardingActive.value) return;
     try {
@@ -347,25 +441,43 @@ function registerHandlers(deps) {
       if (!channelPost) return;
       const channelId = channelPost.chat.id.toString();
       const messageId = channelPost.message_id;
-      botLogger.info(`📨 Получен channel_post из канала ${channelId}: ${messageId}`);
-      const monitoredChannels = await db.getMonitoredChannels();
-      const isMonitored = monitoredChannels.some(ch => ch.channel_id === channelId);
-      if (isMonitored) {
-        botLogger.info(`🎯 Канал ${channelId} отслеживается, пересылаем сообщение ${messageId}`);
-        await helpers.forwardMessageFromChannel(bot, channelId, messageId);
+
+      // Находим всех пользователей, которые мониторят этот канал
+      const allUsers = await db.listUsers();
+      for (const user of allUsers) {
+        const hasSub = await db.hasActiveSubscription(user.user_id);
+        if (!hasSub) continue;
+        const monitored = await db.getMonitoredChannels(user.user_id);
+        const found = monitored.find(ch => ch.channel_id === channelId);
+        if (found) {
+          botLogger.info(`📨 Пересылка сообщения ${messageId} для пользователя ${user.user_id}`);
+          await helpers.forwardMessageFromChannel(ctx.bot, user.user_id, channelId, messageId);
+        }
       }
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: channel_post handler');
     }
   });
 
-  // ---------- Обработка текстовых сообщений (состояния) ----------
+  // ---------- Обработка текстовых сообщений (состояния FSM) ----------
   bot.on('message', async (ctx) => {
+    // Игнорируем сообщения из каналов
+    if (ctx.chat && ctx.chat.type === 'channel') return;
+
     const userId = ctx.from.id;
     const stateData = userStates.get(userId);
     const state = stateData ? stateData.state : null;
     const text = ctx.message.text?.trim();
-    if (!text || (ctx.message.chat && ctx.message.chat.type === 'channel')) return;
+    if (!text) return;
+
+    // Проверяем пользователя только если состояние не админское (админские проверяются отдельно)
+    // Но для всех состояний, кроме админских, нужна подписка.
+    // Для админских состояний проверка будет внутри.
+    const isAdminState = state && state.startsWith('admin_waiting_');
+    if (!isAdminState) {
+      const ok = await ensureUser(ctx);
+      if (!ok) return;
+    }
 
     try {
       // Отмена действия
@@ -376,40 +488,42 @@ function registerHandlers(deps) {
           returnMenu = youtubeMenu;
         } else if (state === 'waiting_for_rss_add' || state === 'waiting_for_rss_remove') {
           returnMenu = rssMenu;
+        } else if (state === 'admin_waiting_add_sub' || state === 'admin_waiting_remove_user') {
+          returnMenu = adminMenu;
         }
-        await ctx.reply('❌ Действие отменено. Возвращаюсь в меню.', returnMenu);
+        await ctx.reply('❌ Действие отменено.', returnMenu);
         return;
       }
 
-      // Состояния
+      // ---------- Состояния пользователей ----------
       if (state === 'waiting_for_youtube_link') {
-        await helpers.handleAddYouTube(ctx, text, youtubeMenu);
+        await helpers.handleAddYouTube(ctx, text, youtubeMenu, userId);
         userStates.delete(userId);
         return;
       }
 
       if (state === 'waiting_for_youtube_remove') {
-        await helpers.handleYouTubeRemove(ctx, text, youtubeMenu);
+        await helpers.handleYouTubeRemove(ctx, text, youtubeMenu, userId);
         userStates.delete(userId);
         return;
       }
 
       if (state === 'waiting_for_rss_add') {
-        await helpers.addRssFeed(ctx, text, rssMenu);
+        await helpers.addRssFeed(ctx, text, rssMenu, userId);
         userStates.delete(userId);
         return;
       }
 
       if (state === 'waiting_for_rss_remove') {
-        await helpers.removeRssFeed(ctx, text, rssMenu);
+        await helpers.removeRssFeed(ctx, text, rssMenu, userId);
         userStates.delete(userId);
         return;
       }
 
       if (state === 'waiting_for_keyword_add') {
-        const added = await db.addKeyword(text);
+        const added = await db.addKeyword(userId, text);
         userStates.delete(userId);
-        if (added > 0) {
+        if (added) {
           await ctx.reply(`✅ Ключевое слово "${text}" добавлено.`, keywordsMenu);
         } else {
           await ctx.reply(`⚠️ Слово "${text}" уже существует.`, keywordsMenu);
@@ -418,12 +532,12 @@ function registerHandlers(deps) {
       }
 
       if (state === 'waiting_for_keyword_remove') {
-        const keywords = await db.getKeywords();
+        const keywords = await db.getKeywords(userId);
         const keywordToRemove = keywords.find(k => k.toLowerCase() === text.toLowerCase());
         if (!keywordToRemove) {
           await ctx.reply(`❌ Слово "${text}" не найдено.`, keywordsMenu);
         } else {
-          await db.removeKeyword(keywordToRemove);
+          await db.removeKeyword(userId, keywordToRemove);
           await ctx.reply(`✅ Ключевое слово "${keywordToRemove}" удалено.`, keywordsMenu);
         }
         userStates.delete(userId);
@@ -431,35 +545,90 @@ function registerHandlers(deps) {
       }
 
       if (state === 'waiting_for_target_channel_add') {
-        const result = await helpers.addChannelSimple(text, 'target');
+        const result = await helpers.addChannelSimple(userId, text, 'target');
         userStates.delete(userId);
         await ctx.reply(result.message, targetChannelsMenu);
         return;
       }
 
       if (state === 'waiting_for_monitored_channel_add') {
-        const result = await helpers.addChannelSimple(text, 'monitored');
+        const result = await helpers.addChannelSimple(userId, text, 'monitored');
         userStates.delete(userId);
         await ctx.reply(result.message, monitoredChannelsMenu);
         return;
       }
 
       if (state === 'waiting_for_target_channel_remove') {
-        await helpers.removeChannelSimple(ctx, text, 'target', { targetChannelsMenu, monitoredChannelsMenu });
+        await helpers.removeChannelSimple(ctx, text, 'target', { targetChannelsMenu, monitoredChannelsMenu }, userId);
         userStates.delete(userId);
         return;
       }
 
       if (state === 'waiting_for_monitored_channel_remove') {
-        await helpers.removeChannelSimple(ctx, text, 'monitored', { targetChannelsMenu, monitoredChannelsMenu });
+        await helpers.removeChannelSimple(ctx, text, 'monitored', { targetChannelsMenu, monitoredChannelsMenu }, userId);
         userStates.delete(userId);
         return;
       }
+
+      // ---------- Админские состояния ----------
+      if (state === 'admin_waiting_add_sub') {
+        if (!(await isAdmin(userId))) {
+          await ctx.reply('⛔ Нет прав.');
+          userStates.delete(userId);
+          return;
+        }
+        const parts = text.split(' ');
+        if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) {
+          await ctx.reply('❌ Неверный формат. Введите: ID_пользователя количество_дней', adminMenu);
+          return;
+        }
+        const targetUserId = parseInt(parts[0]);
+        const days = parseInt(parts[1]);
+        const success = await db.updateUserSubscription(targetUserId, days);
+        await ctx.reply(
+          success
+            ? `✅ Пользователю ${targetUserId} добавлено ${days} дней.`
+            : `❌ Пользователь ${targetUserId} не найден.`,
+          adminMenu
+        );
+        userStates.delete(userId);
+        return;
+      }
+
+      if (state === 'admin_waiting_remove_user') {
+        if (!(await isAdmin(userId))) {
+          await ctx.reply('⛔ Нет прав.');
+          userStates.delete(userId);
+          return;
+        }
+        const targetUserId = parseInt(text);
+        if (isNaN(targetUserId)) {
+          await ctx.reply('❌ Введите корректный числовой ID.', adminMenu);
+          return;
+        }
+        const success = await db.deleteUser(targetUserId);
+        await ctx.reply(
+          success
+            ? `✅ Пользователь ${targetUserId} удалён.`
+            : `❌ Пользователь ${targetUserId} не найден.`,
+          adminMenu
+        );
+        userStates.delete(userId);
+        return;
+      }
+
+      // Если состояние не распознано, игнорируем
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: message handler (state processing)');
       await ctx.reply('❌ Произошла ошибка при обработке команды.');
     }
   });
+
+  // ---------- Обработка ошибок бота ----------
+  bot.catch((err, ctx) => {
+    errorHandler.handleError(err, 'handlers.js: bot.catch');
+    ctx.reply('❌ Произошла внутренняя ошибка. Попробуйте позже.').catch(() => {});
+  });
 }
 
-module.exports = registerHandlers;
+module.exports = { registerHandlers };
