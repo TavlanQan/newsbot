@@ -268,8 +268,8 @@ async function getRssFeeds() {
 async function getRssFeedsWithMeta() {
   const dbFeeds = await getRssFeeds();
   
-  // Получаем начальные ленты из .env
-  const envFeeds = config.RSS_FEEDS ? config.RSS_FEEDS.split(',').filter(f => f.trim()) : [];
+  // Получаем начальные ленты из .env (уже массив)
+  const envFeeds = Array.isArray(config.RSS_FEEDS) ? config.RSS_FEEDS : [];
   
   // Фильтруем только те, что не YouTube
   const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
@@ -335,9 +335,9 @@ async function removeRssFeed(ctx, input, rssMenu) {
     }
 
     // Проверяем, является ли лента системной (из .env)
-    const envFeeds = config.RSS_FEEDS ? config.RSS_FEEDS.split(',').filter(f => f.trim()) : [];
-    const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
-    const envFeedsFiltered = envFeeds.filter(feed => !feed.startsWith(youtubePrefix));
+const envFeeds = Array.isArray(config.RSS_FEEDS) ? config.RSS_FEEDS : [];
+const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
+const envFeedsFiltered = envFeeds.filter(feed => !feed.startsWith(youtubePrefix));
 
     let feedToRemove = null;
     const num = parseInt(input);
