@@ -324,7 +324,7 @@ function registerHandlers(deps) {
     if (!ok) return;
     const userId = ctx.from.id;
     userStates.set(userId, { state: 'waiting_for_keyword_add' });
-    await ctx.reply('✏️ Введите ключевое слово для добавления:');
+    await ctx.reply('✏️ Введите ключевое слово для добавления (можно несколько через запятую или пробел):');
   });
 
   bot.hears('🗑️ Удалить ключевое слово', async (ctx) => {
@@ -332,7 +332,7 @@ function registerHandlers(deps) {
     if (!ok) return;
     const userId = ctx.from.id;
     userStates.set(userId, { state: 'waiting_for_keyword_remove' });
-    await ctx.reply('🗑️ Введите ключевое слово для удаления:');
+    await ctx.reply('🗑️ Введите ключевое слово для удаления (можно несколько через запятую или пробел):');
   });
 
   // ---------- Целевые каналы ----------
@@ -520,26 +520,75 @@ function registerHandlers(deps) {
         return;
       }
 
+      // --- МАССОВОЕ ДОБАВЛЕНИЕ ключевых слов (поддержка запятой и пробела) ---
       if (state === 'waiting_for_keyword_add') {
-        const added = await db.addKeyword(userId, text);
-        userStates.delete(userId);
-        if (added) {
-          await ctx.reply(`✅ Ключевое слово "${text}" добавлено.`, keywordsMenu);
+        let keywordsList;
+        if (text.includes(',')) {
+          keywordsList = text.split(',').map(kw => kw.trim()).filter(kw => kw.length > 0);
         } else {
-          await ctx.reply(`⚠️ Слово "${text}" уже существует.`, keywordsMenu);
+          keywordsList = text.split(/\s+/).filter(kw => kw.length > 0);
         }
+
+        if (keywordsList.length === 0) {
+          await ctx.reply('❌ Вы не ввели ни одного ключевого слова.', keywordsMenu);
+          userStates.delete(userId);
+          return;
+        }
+
+        let addedCount = 0;
+        let existsCount = 0;
+
+        for (const kw of keywordsList) {
+          const added = await db.addKeyword(userId, kw);
+          if (added) addedCount++;
+          else existsCount++;
+        }
+
+        let reply = `✅ Добавлено ключевых слов: ${addedCount}`;
+        if (existsCount > 0) reply += `, уже существовали: ${existsCount}`;
+        await ctx.reply(reply, keywordsMenu);
+        userStates.delete(userId);
         return;
       }
 
+      // --- МАССОВОЕ УДАЛЕНИЕ ключевых слов (поддержка запятой и пробела) ---
       if (state === 'waiting_for_keyword_remove') {
-        const keywords = await db.getKeywords(userId);
-        const keywordToRemove = keywords.find(k => k.toLowerCase() === text.toLowerCase());
-        if (!keywordToRemove) {
-          await ctx.reply(`❌ Слово "${text}" не найдено.`, keywordsMenu);
+        let keywordsToRemove;
+        if (text.includes(',')) {
+          keywordsToRemove = text.split(',').map(kw => kw.trim()).filter(kw => kw.length > 0);
         } else {
-          await db.removeKeyword(userId, keywordToRemove);
-          await ctx.reply(`✅ Ключевое слово "${keywordToRemove}" удалено.`, keywordsMenu);
+          keywordsToRemove = text.split(/\s+/).filter(kw => kw.length > 0);
         }
+
+        if (keywordsToRemove.length === 0) {
+          await ctx.reply('❌ Вы не ввели ни одного ключевого слова для удаления.', keywordsMenu);
+          userStates.delete(userId);
+          return;
+        }
+
+        const allKeywords = await db.getKeywords(userId);
+        const lowerKeywords = allKeywords.map(k => k.toLowerCase());
+
+        let removedCount = 0;
+        let notFoundCount = 0;
+        const removedList = [];
+
+        for (const kw of keywordsToRemove) {
+          const index = lowerKeywords.indexOf(kw.toLowerCase());
+          if (index !== -1) {
+            const original = allKeywords[index];
+            await db.removeKeyword(userId, original);
+            removedCount++;
+            removedList.push(original);
+          } else {
+            notFoundCount++;
+          }
+        }
+
+        let reply = `✅ Удалено ключевых слов: ${removedCount}`;
+        if (notFoundCount > 0) reply += `, не найдено: ${notFoundCount}`;
+        if (removedList.length > 0) reply += `\nУдалены: ${removedList.join(', ')}`;
+        await ctx.reply(reply, keywordsMenu);
         userStates.delete(userId);
         return;
       }
