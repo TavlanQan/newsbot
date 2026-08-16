@@ -150,31 +150,45 @@ async function updateAllFeeds(userId, newFeedsArray) {
 // ---------- Извлечение идентификатора канала из ссылки ----------
 function extractChannelIdentifier(input) {
   const trimmed = input.trim();
-  // Если это уже ID вида UC...
-  if (/^UC[\w-]{22,}$/.test(trimmed)) return trimmed;
+
+  // Уже настоящий Channel ID
+  if (/^UC[\w-]{22}$/.test(trimmed)) {
+    return trimmed;
+  }
 
   try {
     const url = new URL(trimmed);
-    // youtube.com или youtu.be
-    if (url.hostname === 'youtu.be' || url.hostname === 'www.youtu.be') {
-      // это видео, не канал
+
+    const hostname = url.hostname.toLowerCase();
+
+    if (
+      hostname !== 'youtube.com' &&
+      hostname !== 'www.youtube.com'
+    ) {
       return null;
     }
-    // /@handle
-    const matchAt = url.pathname.match(/^\/@([\w-]+)/);
-    if (matchAt) return matchAt[1]; // возвращаем handle без @
-    // /channel/UC...
-    const matchChannel = url.pathname.match(/^\/channel\/(UC[\w-]+)/);
-    if (matchChannel) return matchChannel[1];
-    // /c/name
-    const matchC = url.pathname.match(/^\/c\/([\w-]+)/);
-    if (matchC) return matchC[1];
-    // /watch?v=... (не канал)
-    if (url.pathname === '/watch' && url.searchParams.has('v')) return null;
+
+    // Разрешаем URL канала передать непосредственно RSS-сервису.
+    if (
+      url.pathname.startsWith('/@') ||
+      url.pathname.startsWith('/channel/') ||
+      url.pathname.startsWith('/c/')
+    ) {
+      return url.toString();
+    }
+
+    // Видео не является каналом.
+    if (
+      url.pathname === '/watch' &&
+      url.searchParams.has('v')
+    ) {
+      return null;
+    }
+
+    return null;
   } catch {
     return null;
   }
-  return null;
 }
 
 // ---------- Улучшенная валидация YouTube-ссылок ----------
