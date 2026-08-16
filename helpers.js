@@ -209,8 +209,8 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
 
     // Если значение отсутствует или не строка, используем значение по умолчанию
     if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
-      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005/rss');
-      serviceUrlRaw = 'http://localhost:5005/rss';
+      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005');
+      serviceUrlRaw = 'http://localhost:5005';
     }
 
     let serviceUrl = serviceUrlRaw.trim();
