@@ -138,7 +138,6 @@ async function getYouTubeFeeds(userId) {
 }
 
 async function updateAllFeeds(userId, newFeedsArray) {
-  // Удаляем все старые ленты пользователя и добавляем новые
   const currentFeeds = await db.getUserFeeds(userId);
   for (const feed of currentFeeds) {
     await db.removeUserFeed(userId, feed);
@@ -148,21 +147,49 @@ async function updateAllFeeds(userId, newFeedsArray) {
   }
 }
 
+// ---------- Улучшенная валидация YouTube-ссылок ----------
 function isValidYouTubeUrl(input) {
-  const patterns = [
-    /^https?:\/\/(www\.)?youtube\.com\/@[\w-]+(\/)?$/,
-    /^https?:\/\/(www\.)?youtube\.com\/c\/[\w-]+(\/)?$/,
-    /^https?:\/\/(www\.)?youtube\.com\/channel\/UC[\w-]{22,}(\/)?$/,
-    /^https?:\/\/youtu\.be\/[\w-]+$/,
-    /^https?:\/\/(www\.)?youtube\.com\/watch\?v=[\w-]+$/,
-    /^UC[\w-]{22,}$/
-  ];
-  return patterns.some(pattern => pattern.test(input));
+  if (typeof input !== 'string') return false;
+  const trimmed = input.trim();
+  if (!trimmed) return false;
+
+  // Прямой channel ID (UC...)
+  if (/^UC[\w-]{22,}$/.test(trimmed)) return true;
+
+  try {
+    const url = new URL(trimmed);
+    // Протокол должен быть http или https
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+
+    // Допустимые хосты
+    const validHosts = ['youtube.com', 'www.youtube.com', 'youtu.be', 'www.youtu.be'];
+    if (!validHosts.includes(url.hostname)) return false;
+
+    // Для youtu.be проверяем, что есть path
+    if (url.hostname === 'youtu.be' || url.hostname === 'www.youtu.be') {
+      return url.pathname.length > 1;
+    }
+
+    // Для youtube.com проверяем пути
+    return (
+      url.pathname.startsWith('/@') ||
+      url.pathname.startsWith('/c/') ||
+      url.pathname.startsWith('/channel/UC') ||
+      url.pathname === '/watch'
+    );
+  } catch {
+    return false;
+  }
 }
 
+// ---------- Добавление YouTube-канала (исправленное) ----------
 async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
   try {
-    if (!isValidYouTubeUrl(input)) {
+    // Очищаем входную строку
+    const cleanedInput = input.trim();
+    botLogger.info(`YouTube input (cleaned): ${cleanedInput}`);
+
+    if (!isValidYouTubeUrl(cleanedInput)) {
       await ctx.reply(
         '❌ Это не похоже на ссылку YouTube.\n\n' +
         'Поддерживаются форматы:\n' +
@@ -176,12 +203,31 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       return;
     }
 
-    const serviceUrl = `${config.YOUTUBE_RSS_SERVICE_URL}?channel=${encodeURIComponent(input)}`;
-    // Проверка доступности микросервиса
+    // Проверка и очистка URL микросервиса
+    const serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
+    if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
+      await ctx.reply(
+        '❌ Переменная YOUTUBE_RSS_SERVICE_URL не задана в .env.\n' +
+        'Пример: YOUTUBE_RSS_SERVICE_URL=http://localhost:5004/rss',
+        youtubeMenu
+      );
+      return;
+    }
+    const serviceUrl = serviceUrlRaw.trim();
+    if (!serviceUrl.startsWith('http://') && !serviceUrl.startsWith('https://')) {
+      await ctx.reply(
+        '❌ YOUTUBE_RSS_SERVICE_URL должен начинаться с http:// или https://.\n' +
+        'Текущее значение: ' + serviceUrl,
+        youtubeMenu
+      );
+      return;
+    }
+
+    // Проверяем доступность микросервиса (запрос к корневому URL)
     try {
-      await axios.get(config.YOUTUBE_RSS_SERVICE_URL, { timeout: 3000 });
+      await axios.get(serviceUrl, { timeout: 3000 });
     } catch (error) {
-      if (error.code === 'ECONNREFUSED') {
+      if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
         await ctx.reply(
           '❌ Микросервис YouTube-RSS недоступен.\n\n' +
           'Проверьте:\n' +
@@ -191,29 +237,32 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
         );
         return;
       }
+      // Если другая ошибка (например, таймаут) – пробрасываем дальше
       throw error;
     }
 
+    // Формируем полный URL для RSS-ленты
+    const finalUrl = `${serviceUrl}?channel=${encodeURIComponent(cleanedInput)}`;
     const feeds = await db.getUserFeeds(userId);
-    if (feeds.includes(serviceUrl)) {
+    if (feeds.includes(finalUrl)) {
       await ctx.reply('ℹ️ Этот YouTube канал уже отслеживается.', youtubeMenu);
       return;
     }
 
-    await db.addUserFeed(userId, serviceUrl);
+    await db.addUserFeed(userId, finalUrl);
 
     await ctx.reply(
       '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
-      `📡 RSS-ссылка: ${serviceUrl}\n\n` +
+      `📡 RSS-ссылка: ${finalUrl}\n\n` +
       'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
       youtubeMenu
     );
-    botLogger.info(`📺 Пользователь ${userId} добавил YouTube: ${input} -> ${serviceUrl}`);
+    botLogger.info(`📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${finalUrl}`);
   } catch (error) {
     errorHandler.handleError(error, 'helpers.js: handleAddYouTube');
     await ctx.reply(
       '❌ Произошла ошибка при добавлении канала.\n\n' +
-      'Проверьте логи: pm2 logs youtube-rss',
+      'Проверьте логи: pm2 logs newsbot и pm2 logs youtube-rss',
       youtubeMenu
     );
   }
@@ -260,10 +309,8 @@ async function getRssFeeds(userId) {
   return feeds.filter(feed => !feed.startsWith(youtubePrefix));
 }
 
-// Новая функция: возвращает RSS-ленты с меткой (все пользовательские, без системных)
 async function getRssFeedsWithMeta(userId) {
   const dbFeeds = await getRssFeeds(userId);
-  // Все ленты теперь принадлежат пользователю, системных больше нет
   return dbFeeds.map(feed => ({ url: feed, fromEnv: false }));
 }
 
@@ -318,7 +365,6 @@ async function removeRssFeed(ctx, input, rssMenu, userId) {
       return;
     }
 
-    // Удаляем ленту (без проверки на системную – их больше нет)
     await db.removeUserFeed(userId, feedToRemove);
     await ctx.reply(`✅ RSS-лента удалена.`, rssMenu);
     botLogger.info(`🗑️ Пользователь ${userId} удалил RSS: ${feedToRemove}`);
