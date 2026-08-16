@@ -208,7 +208,7 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
     if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
       await ctx.reply(
         '❌ Переменная YOUTUBE_RSS_SERVICE_URL не задана в .env.\n' +
-        'Пример: YOUTUBE_RSS_SERVICE_URL=http://localhost:5004/rss',
+        'Пример: YOUTUBE_RSS_SERVICE_URL=http://localhost:5005',
         youtubeMenu
       );
       return;
