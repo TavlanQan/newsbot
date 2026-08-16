@@ -203,16 +203,17 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       return;
     }
 
-    // Проверка и очистка URL микросервиса
-    const serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
+    // ---------- Получение и проверка URL микросервиса ----------
+    let serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
+    // Логируем, что пришло из конфига
+    botLogger.info(`serviceUrlRaw from config: ${JSON.stringify(serviceUrlRaw)}`);
+
+    // Если значение отсутствует или не строка, используем значение по умолчанию
     if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
-      await ctx.reply(
-        '❌ Переменная YOUTUBE_RSS_SERVICE_URL не задана в .env.\n' +
-        'Пример: YOUTUBE_RSS_SERVICE_URL=http://localhost:5005',
-        youtubeMenu
-      );
-      return;
+      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005');
+      serviceUrlRaw = 'http://localhost:5005';
     }
+
     const serviceUrl = serviceUrlRaw.trim();
     if (!serviceUrl.startsWith('http://') && !serviceUrl.startsWith('https://')) {
       await ctx.reply(
