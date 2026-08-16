@@ -205,16 +205,26 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
 
     // ---------- Получение и проверка URL микросервиса ----------
     let serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
-    // Логируем, что пришло из конфига
     botLogger.info(`serviceUrlRaw from config: ${JSON.stringify(serviceUrlRaw)}`);
 
     // Если значение отсутствует или не строка, используем значение по умолчанию
     if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
-      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005');
-      serviceUrlRaw = 'http://localhost:5005';
+      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005/rss');
+      serviceUrlRaw = 'http://localhost:5005/rss';
     }
 
-    const serviceUrl = serviceUrlRaw.trim();
+    let serviceUrl = serviceUrlRaw.trim();
+
+    // Если URL не заканчивается на /rss, добавляем его
+    if (!serviceUrl.endsWith('/rss')) {
+      if (serviceUrl.endsWith('/')) {
+        serviceUrl += 'rss';
+      } else {
+        serviceUrl += '/rss';
+      }
+      botLogger.info(`Добавлен /rss к URL микросервиса: ${serviceUrl}`);
+    }
+
     if (!serviceUrl.startsWith('http://') && !serviceUrl.startsWith('https://')) {
       await ctx.reply(
         '❌ YOUTUBE_RSS_SERVICE_URL должен начинаться с http:// или https://.\n' +
@@ -224,7 +234,7 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       return;
     }
 
-    // Проверяем доступность микросервиса (запрос к корневому URL)
+    // Проверяем доступность микросервиса (запрос к полному URL с /rss)
     try {
       await axios.get(serviceUrl, { timeout: 3000 });
     } catch (error) {
@@ -238,7 +248,7 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
         );
         return;
       }
-      // Если другая ошибка (например, таймаут) – пробрасываем дальше
+      // Если ошибка 404 – микросервис работает, но путь неверный (маловероятно, так как мы добавили /rss)
       throw error;
     }
 
