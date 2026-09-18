@@ -10,7 +10,7 @@ const errorHandler = require('./errorHandler');
 const { registerHandlers } = require('./handlers');
 const sqlite3 = require('sqlite3').verbose();
 
-// FIX: маркер загрузки файла в PM2 stdout. Если этого лога нет после
+// Маркер загрузки файла в PM2 stdout. Если этого лога нет после
 // `pm2 restart newsbot` — значит PM2 запускает НЕ ЭТОТ файл.
 console.log(`[bot.js] module loaded at ${new Date().toISOString()}, RSS_UPDATE_INTERVAL=${config.RSS_UPDATE_INTERVAL}`);
 
@@ -18,9 +18,7 @@ const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 const userStates = new Map();
 
 // ---------- Персистентный флаг «пересылка активна» ----------
-// FIX: раньше это был обычный объект в памяти — после рестарта терялся,
-// RSS-цикл не запускался, пока пользователь не нажмёт кнопку заново.
-// Теперь значение хранится в БД (таблица settings) и восстанавливается при старте.
+// Значение хранится в БД (таблица settings) и восстанавливается при старте.
 // `handlers.js` продолжает писать `isForwardingActive.value = true/false` —
 // это работает через Proxy, запись в БД происходит прозрачно.
 const DB_FILE = config.DB_PATH || './news_bot.db';
@@ -58,7 +56,7 @@ async function saveForwardingState(value) {
   });
 }
 
-// FIX: Proxy вместо объекта — set на .value автоматически сохраняет в БД.
+// Proxy вместо объекта — set на .value автоматически сохраняет в БД.
 const _forwardingStore = { value: true };
 const isForwardingActive = new Proxy(_forwardingStore, {
   set(target, prop, value) {
@@ -126,7 +124,7 @@ async function initDatabase() {
           requested_at INTEGER DEFAULT (strftime('%s', 'now')),
           status       TEXT DEFAULT 'pending'
       );`,
-      // FIX: новая таблица для персистентного состояния бота
+      // Таблица для персистентного состояния бота
       `CREATE TABLE IF NOT EXISTS settings (
           key   TEXT PRIMARY KEY,
           value TEXT
@@ -232,7 +230,6 @@ async function shutdown() {
 }
 
 // ---------- Периодическая очистка userStates ----------
-// FIX: умеет работать и с объектами { state, timestamp }, и со строками-состояниями.
 setInterval(() => {
   const now = Date.now();
   let cleared = 0;
@@ -251,7 +248,7 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ---------- Основной RSS-цикл ----------
-// FIX: вынесен в отдельную функцию с явным логированием в botLogger.
+// Вынесен в отдельную функцию с явным логированием в botLogger.
 // Даже если rssTransport сломан — мы увидим начало и конец цикла в bot-*.log.
 async function runRssCycle(sourceLabel) {
   const active = isForwardingActive.value;
@@ -267,8 +264,6 @@ async function runRssCycle(sourceLabel) {
     await newsService.checkAllFeeds(bot);
     botLogger.info(`✅ RSS-цикл [${sourceLabel}] завершён за ${Date.now() - started} мс`);
   } catch (error) {
-    // FIX: раньше необработанное исключение внутри cron-колбэка не давало
-    // НИ ОДНОЙ строчки в bot-*.log, из-за чего диагностика была слепой.
     errorHandler.handleError(error, `bot.js: runRssCycle [${sourceLabel}]`);
   }
 }
@@ -287,17 +282,17 @@ async function startBot() {
     await bootstrapAdmins();
     await migrateSystemFeeds();
 
-    // FIX: восстановление флага пересылки из БД
+    // Восстановление флага пересылки из БД
     const restored = await loadForwardingState();
     isForwardingActive.value = restored;
     botLogger.info(`📌 Состояние пересылки восстановлено: ${restored ? 'ВКЛ' : 'ВЫКЛ'}`);
 
-    await bot.launch();
-    botLogger.info('✅ Бот запущен и готов к работе.');
-
+    // ========================================================================
+    // ВАЖНО: cron регистрируется ДО bot.launch().
+    // Пересылка RSS не зависит от Telegram — если Telegram API недоступен,
+    // RSS-цикл всё равно должен работать. Пусть cron стартует первым.
+    // ========================================================================
     const intervalMinutes = config.RSS_UPDATE_INTERVAL || 10;
-
-    // FIX: явная регистрация cron + лог, что cron вообще поставлен
     const cronExpr = `*/${intervalMinutes} * * * *`;
     cron.schedule(cronExpr, () => runRssCycle('cron'));
     botLogger.info(`✅ Мониторинг RSS настроен: cron="${cronExpr}" (интервал ${intervalMinutes} мин)`);
@@ -312,7 +307,24 @@ async function startBot() {
       }
     });
 
-    // Первая проверка через 15 секунд после запуска — с явным логом
+    // ========================================================================
+    // КРИТИЧЕСКИЙ ФИКС:
+    // В Telegraf 4.x bot.launch() возвращает Promise, который резолвится
+    // ТОЛЬКО при bot.stop(). Если поставить `await bot.launch()` — весь код
+    // ниже никогда не выполнится: cron не зарегистрируется, RSS-цикл не
+    // запустится, "✅ Бот запущен" не залогируется. Бот при этом отвечает
+    // на кнопки, потому что Telegraf живёт своей жизнью в фоне — и именно
+    // это вводило в заблуждение при диагностике.
+    //
+    // Правильно: НЕ await. Ошибку ловим через .catch().
+    // ========================================================================
+    bot.launch().catch((err) => {
+      errorHandler.handleError(err, 'bot.js: bot.launch');
+      process.exit(1);
+    });
+    botLogger.info('✅ Бот запущен и готов к работе.');
+
+    // Первая проверка RSS через 15 секунд после запуска
     setTimeout(() => {
       runRssCycle('startup').catch((e) =>
         errorHandler.handleError(e, 'bot.js: startup runRssCycle')
