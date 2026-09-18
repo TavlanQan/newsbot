@@ -1,8 +1,10 @@
+// bot.js
 const { Telegraf } = require('telegraf');
 const cron = require('node-cron');
 const db = require('./db');
 const config = require('./config');
 const newsService = require('./newsService');
+const helpers = require('./helpers');
 const { botLogger } = require('./utils/logger');
 const errorHandler = require('./errorHandler');
 const { registerHandlers } = require('./handlers');
@@ -49,11 +51,22 @@ async function initDatabase() {
         feed_url TEXT,
         PRIMARY KEY (user_id, feed_url)
     );`,
+    `CREATE TABLE IF NOT EXISTS system_feeds (
+        feed_url TEXT PRIMARY KEY,
+        added_at INTEGER DEFAULT (strftime('%s','now'))
+    );`,
     `CREATE TABLE IF NOT EXISTS forwarded_messages (
         message_id INTEGER,
         channel_id TEXT,
         timestamp INTEGER DEFAULT (strftime('%s', 'now')),
         PRIMARY KEY (message_id, channel_id)
+    );`,
+    `CREATE TABLE IF NOT EXISTS access_requests (
+        user_id      INTEGER PRIMARY KEY,
+        username     TEXT,
+        first_name   TEXT,
+        requested_at INTEGER DEFAULT (strftime('%s', 'now')),
+        status       TEXT DEFAULT 'pending'
     );`
   ];
 
@@ -70,6 +83,77 @@ async function initDatabase() {
     if (err) botLogger.error(`Ошибка закрытия БД: ${err.message}`);
     else botLogger.info('✅ База данных инициализирована (таблицы созданы)');
   });
+}
+
+// ---------- Bootstrap главного администратора ----------
+// Идемпотентно: при каждом старте гарантирует, что главный админ из .env
+// существует, имеет is_admin=1 и бессрочный доступ (subscription_end=NULL).
+async function bootstrapAdmins() {
+  const adminIdRaw = process.env.ADMIN_CHAT_ID || config.ADMIN_CHAT_ID;
+  const adminId = parseInt(adminIdRaw, 10);
+
+  if (!adminIdRaw || isNaN(adminId)) {
+    botLogger.error(
+      '❌ ADMIN_CHAT_ID не задан (или не число) — главный администратор не будет создан.\n' +
+      '   Управление админами и выдача доступов будут недоступны.'
+    );
+    return;
+  }
+
+  try {
+    const existing = await db.getUser(adminId);
+
+    if (!existing) {
+      await db.addUser(adminId, true, null);
+      botLogger.info(`👑 Создан главный администратор ${adminId} (бессрочный доступ)`);
+      return;
+    }
+
+    if (existing.is_admin !== 1 || existing.subscription_end !== null) {
+      await db.run(
+        'UPDATE users SET is_admin = 1, subscription_end = NULL WHERE user_id = ?',
+        [adminId]
+      );
+      botLogger.info(`👑 Права главного администратора для ${adminId} подтверждены`);
+    } else {
+      botLogger.info(`👑 Главный администратор ${adminId} уже настроен корректно`);
+    }
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: bootstrapAdmins');
+  }
+}
+
+// ---------- Миграция системных RSS-лент из .env в БД ----------
+// Однократная и идемпотентная:
+//  - если в system_feeds уже есть записи — ничего не делаем;
+//  - иначе читаем RSS_FEEDS из .env и переносим в БД.
+// После этого переменная RSS_FEEDS в .env больше не используется
+// (можно оставить её как «архив» или удалить — на работу бота не влияет).
+async function migrateSystemFeeds() {
+  try {
+    const existing = await db.getSystemFeeds();
+    if (existing.length > 0) {
+      botLogger.info(`🌐 Системные ленты уже в БД: ${existing.length} шт. Миграция не нужна.`);
+      return;
+    }
+
+    const fromEnv = helpers.getSystemFeedUrls();
+    if (fromEnv.length === 0) {
+      botLogger.info('🌐 В .env нет RSS_FEEDS — миграция не требуется.');
+      return;
+    }
+
+    let added = 0;
+    for (const url of fromEnv) {
+      const ok = await db.addSystemFeed(url);
+      if (ok) added++;
+    }
+    botLogger.info(
+      `🌐 Мигрировано системных лент из .env в БД: ${added}/${fromEnv.length}`
+    );
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: migrateSystemFeeds');
+  }
 }
 
 // ---------- Функция завершения ----------
@@ -108,6 +192,8 @@ async function startBot() {
   try {
     botLogger.info('🚀 Запуск бота...');
     await initDatabase();
+    await bootstrapAdmins();
+    await migrateSystemFeeds();
 
     await bot.launch();
     botLogger.info('✅ Бот запущен и готов к работе.');

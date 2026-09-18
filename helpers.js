@@ -6,6 +6,51 @@ const db = require('./db');
 const config = require('./config');
 const queue = require('./queue');
 
+// ---------- Утилита: нормализованный URL микросервиса YouTube ----------
+// Возвращает URL, гарантированно заканчивающийся на /rss, и не равный undefined.
+// Используется везде, где нужно отличить YouTube-фиды от обычных RSS.
+function getYouTubeServiceUrl() {
+  let serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
+
+  if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
+    botLogger.warn(
+      '⚠️ YOUTUBE_RSS_SERVICE_URL не задан в .env — использую значение по умолчанию: http://localhost:5005/rss'
+    );
+    serviceUrlRaw = 'http://localhost:5005/rss';
+  }
+
+  let serviceUrl = serviceUrlRaw.trim();
+  if (!serviceUrl.endsWith('/rss')) {
+    if (serviceUrl.endsWith('/')) {
+      serviceUrl += 'rss';
+    } else {
+      serviceUrl += '/rss';
+    }
+  }
+  return serviceUrl;
+}
+
+// ---------- Утилита: список системных RSS-лент из .env ----------
+// Используется ТОЛЬКО для однократной миграции при старте бота (см. bot.js).
+// ВАЖНО: config.RSS_FEEDS уже парсится в массив внутри config.js.
+// Но оставляем защиту от строки на случай изменения парсера в будущем.
+function getSystemFeedUrls() {
+  const feeds = config.RSS_FEEDS;
+
+  if (Array.isArray(feeds)) {
+    return feeds.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.trim());
+  }
+
+  if (typeof feeds === 'string' && feeds.trim()) {
+    return feeds
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
 // ---------- Общие функции для каналов (с user_id) ----------
 async function addChannelSimple(userId, channelIdentifier, channelType) {
   try {
@@ -16,7 +61,8 @@ async function addChannelSimple(userId, channelIdentifier, channelType) {
       return { success: false, message: '❌ Неверный формат ID канала. Должен начинаться с -100 для супергрупп' };
     }
     let result;
-    const channelTitle = channelType === 'target' ? `Канал ${channelIdentifier}` : `Мониторинг ${channelIdentifier}`;
+    const channelTitle =
+      channelType === 'target' ? `Канал ${channelIdentifier}` : `Мониторинг ${channelIdentifier}`;
     if (channelType === 'target') {
       result = await db.addTargetChannel(userId, channelIdentifier, null, channelTitle);
     } else {
@@ -46,15 +92,16 @@ async function removeChannelSimple(ctx, userText, type, menus, userId) {
       await ctx.reply(`❌ Нет ${isTarget ? 'целевых' : 'отслеживаемых'} каналов для удаления.`, menu);
       return;
     }
-    const found = allChannels.find(ch =>
-      ch.channel_id === userText ||
-      (ch.channel_username && ch.channel_username.includes(userText)) ||
-      (ch.channel_title && ch.channel_title.includes(userText))
+    const found = allChannels.find(
+      (ch) =>
+        ch.channel_id === userText ||
+        (ch.channel_username && ch.channel_username.includes(userText)) ||
+        (ch.channel_title && ch.channel_title.includes(userText))
     );
     if (!found) {
-      const availableChannels = allChannels.map(ch =>
-        `- ${ch.channel_id} (${ch.channel_title || 'без названия'})`
-      ).join('\n');
+      const availableChannels = allChannels
+        .map((ch) => `- ${ch.channel_id} (${ch.channel_title || 'без названия'})`)
+        .join('\n');
       await ctx.reply(`❌ Канал "${userText}" не найден.\n\nДоступные каналы:\n${availableChannels}`, menu);
       return;
     }
@@ -71,6 +118,8 @@ async function removeChannelSimple(ctx, userText, type, menus, userId) {
 }
 
 // ---------- Функции отправки и пересылки (с user_id) ----------
+// Возвращает true сразу после постановки задач в очередь — это НЕ значит,
+// что все сообщения уже доставлены. Реальная отправка асинхронна (см. queue.js).
 async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
   try {
     const targetChannels = await db.getTargetChannels(userId);
@@ -79,7 +128,6 @@ async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
       return false;
     }
 
-    let successCount = 0;
     for (const targetChannel of targetChannels) {
       queue.add(async () => {
         try {
@@ -88,10 +136,14 @@ async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
             disable_web_page_preview: false,
             ...options
           });
-          botLogger.info(`✅ Отправлено сообщение в канал ${targetChannel.channel_id} (пользователь ${userId})`);
-          successCount++;
+          botLogger.info(
+            `✅ Отправлено сообщение в канал ${targetChannel.channel_id} (пользователь ${userId})`
+          );
         } catch (error) {
-          errorHandler.handleError(error, `helpers.js: sendMessageToTargetChannels (queue task for ${targetChannel.channel_id})`);
+          errorHandler.handleError(
+            error,
+            `helpers.js: sendMessageToTargetChannels (queue task for ${targetChannel.channel_id})`
+          );
         }
       });
     }
@@ -107,7 +159,9 @@ async function forwardMessageFromChannel(bot, userId, channelId, messageId) {
     const targetChannels = await db.getTargetChannels(userId);
     const isAlreadyForwarded = await db.isMessageForwarded(messageId, channelId);
     if (isAlreadyForwarded) {
-      botLogger.warn(`⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано (пользователь ${userId})`);
+      botLogger.warn(
+        `⚠️ Сообщение ${messageId} из канала ${channelId} уже было переслано (пользователь ${userId})`
+      );
       return;
     }
     if (targetChannels.length === 0) {
@@ -119,9 +173,14 @@ async function forwardMessageFromChannel(bot, userId, channelId, messageId) {
         try {
           await bot.telegram.forwardMessage(targetChannel.channel_id, channelId, messageId);
           await db.addForwardedMessage(messageId, channelId);
-          botLogger.info(`📤 Переслано сообщение ${messageId} → ${targetChannel.channel_id} (пользователь ${userId})`);
+          botLogger.info(
+            `📤 Переслано сообщение ${messageId} → ${targetChannel.channel_id} (пользователь ${userId})`
+          );
         } catch (error) {
-          errorHandler.handleError(error, `helpers.js: forwardMessageFromChannel (queue task for ${targetChannel.channel_id})`);
+          errorHandler.handleError(
+            error,
+            `helpers.js: forwardMessageFromChannel (queue task for ${targetChannel.channel_id})`
+          );
         }
       });
     }
@@ -133,8 +192,8 @@ async function forwardMessageFromChannel(bot, userId, channelId, messageId) {
 // ---------- YouTube функции (с user_id) ----------
 async function getYouTubeFeeds(userId) {
   const feeds = await db.getUserFeeds(userId);
-  const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
-  return feeds.filter(feed => feed.startsWith(youtubePrefix));
+  const youtubePrefix = getYouTubeServiceUrl();
+  return feeds.filter((feed) => feed.startsWith(youtubePrefix));
 }
 
 async function updateAllFeeds(userId, newFeedsArray) {
@@ -161,10 +220,7 @@ function extractChannelIdentifier(input) {
 
     const hostname = url.hostname.toLowerCase();
 
-    if (
-      hostname !== 'youtube.com' &&
-      hostname !== 'www.youtube.com'
-    ) {
+    if (hostname !== 'youtube.com' && hostname !== 'www.youtube.com') {
       return null;
     }
 
@@ -178,10 +234,7 @@ function extractChannelIdentifier(input) {
     }
 
     // Видео не является каналом.
-    if (
-      url.pathname === '/watch' &&
-      url.searchParams.has('v')
-    ) {
+    if (url.pathname === '/watch' && url.searchParams.has('v')) {
       return null;
     }
 
@@ -219,62 +272,44 @@ function isValidYouTubeUrl(input) {
   }
 }
 
-// ---------- Добавление YouTube-канала (исправленное) ----------
+// ---------- Добавление YouTube-канала ----------
 async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
   try {
-    // Очищаем входную строку
     const cleanedInput = input.trim();
     botLogger.info(`YouTube input (cleaned): ${cleanedInput}`);
 
     if (!isValidYouTubeUrl(cleanedInput)) {
       await ctx.reply(
         '❌ Это не похоже на ссылку YouTube.\n\n' +
-        'Поддерживаются форматы:\n' +
-        '• https://www.youtube.com/@ChannelName\n' +
-        '• https://www.youtube.com/c/ChannelName\n' +
-        '• https://www.youtube.com/channel/UCxxxx\n' +
-        '• https://youtu.be/xxxxxx\n' +
-        '• UCxxxxxxxxxxxxxxxxxxxxx',
+          'Поддерживаются форматы:\n' +
+          '• https://www.youtube.com/@ChannelName\n' +
+          '• https://www.youtube.com/c/ChannelName\n' +
+          '• https://www.youtube.com/channel/UCxxxx\n' +
+          '• https://youtu.be/xxxxxx\n' +
+          '• UCxxxxxxxxxxxxxxxxxxxxx',
         youtubeMenu
       );
       return;
     }
 
-    // Извлекаем идентификатор канала
     const channelId = extractChannelIdentifier(cleanedInput);
     if (!channelId) {
       await ctx.reply(
         '❌ Не удалось извлечь идентификатор канала из ссылки.\n' +
-        'Убедитесь, что это ссылка на канал (не на видео).',
+          'Убедитесь, что это ссылка на канал (не на видео).',
         youtubeMenu
       );
       return;
     }
     botLogger.info(`Извлечён идентификатор канала: ${channelId}`);
 
-    // ---------- Получение и проверка URL микросервиса ----------
-    let serviceUrlRaw = config.YOUTUBE_RSS_SERVICE_URL;
-    botLogger.info(`serviceUrlRaw from config: ${JSON.stringify(serviceUrlRaw)}`);
-
-    if (!serviceUrlRaw || typeof serviceUrlRaw !== 'string') {
-      botLogger.warn('YOUTUBE_RSS_SERVICE_URL не задана, использую значение по умолчанию: http://localhost:5005/rss');
-      serviceUrlRaw = 'http://localhost:5005/rss';
-    }
-
-    let serviceUrl = serviceUrlRaw.trim();
-    if (!serviceUrl.endsWith('/rss')) {
-      if (serviceUrl.endsWith('/')) {
-        serviceUrl += 'rss';
-      } else {
-        serviceUrl += '/rss';
-      }
-      botLogger.info(`Добавлен /rss к URL микросервиса: ${serviceUrl}`);
-    }
+    // Нормализованный URL микросервиса (единая точка истины)
+    const serviceUrl = getYouTubeServiceUrl();
 
     if (!serviceUrl.startsWith('http://') && !serviceUrl.startsWith('https://')) {
       await ctx.reply(
         '❌ YOUTUBE_RSS_SERVICE_URL должен начинаться с http:// или https://.\n' +
-        'Текущее значение: ' + serviceUrl,
+          'Текущее значение: ' + serviceUrl,
         youtubeMenu
       );
       return;
@@ -286,34 +321,30 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
 
     try {
       const response = await axios.get(testUrl, { timeout: 5000 });
-      // Проверяем, что ответ не содержит ошибку
       if (typeof response.data === 'string' && response.data.includes('Ошибка определения канала')) {
         await ctx.reply(
           '❌ Микросервис не смог распознать этот канал.\n' +
-          'Проверьте, что ссылка ведёт на существующий канал, и попробуйте снова.\n' +
-          'Если проблема повторяется, обратитесь к администратору.',
+            'Проверьте, что ссылка ведёт на существующий канал, и попробуйте снова.\n' +
+            'Если проблема повторяется, обратитесь к администратору.',
           youtubeMenu
         );
         return;
       }
-      // Можно дополнительно проверить, что это XML, но пока достаточно.
     } catch (error) {
       if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
         await ctx.reply(
           '❌ Микросервис YouTube-RSS недоступен.\n\n' +
-          'Проверьте:\n' +
-          '• Запущен ли сервис: pm2 status youtube-rss\n' +
-          '• Корректность URL в .env: YOUTUBE_RSS_SERVICE_URL',
+            'Проверьте:\n' +
+            '• Запущен ли сервис: pm2 status youtube-rss\n' +
+            '• Корректность URL в .env: YOUTUBE_RSS_SERVICE_URL',
           youtubeMenu
         );
         return;
       }
-      // Если ошибка 400 – это значит, что сервис работает, но требует параметр? Уже не нужно, мы проверяем с параметром.
-      // Другие ошибки – пробрасываем
       throw error;
     }
 
-    // Формируем полный URL для RSS-ленты (используем извлечённый идентификатор)
+    // Формируем полный URL для RSS-ленты
     const finalUrl = `${serviceUrl}?channel=${encodeURIComponent(channelId)}`;
     const feeds = await db.getUserFeeds(userId);
     if (feeds.includes(finalUrl)) {
@@ -325,9 +356,9 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
 
     await ctx.reply(
       '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
-      `📡 RSS-ссылка: ${finalUrl}\n` +
-      `🔑 Идентификатор: ${channelId}\n\n` +
-      'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
+        `📡 RSS-ссылка: ${finalUrl}\n` +
+        `🔑 Идентификатор: ${channelId}\n\n` +
+        'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
       youtubeMenu
     );
     botLogger.info(`📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${finalUrl}`);
@@ -335,7 +366,7 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
     errorHandler.handleError(error, 'helpers.js: handleAddYouTube');
     await ctx.reply(
       '❌ Произошла ошибка при добавлении канала.\n\n' +
-      'Проверьте логи: pm2 logs newsbot и pm2 logs youtube-rss',
+        'Проверьте логи: pm2 logs newsbot и pm2 logs youtube-rss',
       youtubeMenu
     );
   }
@@ -354,13 +385,13 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu, userId) {
     if (!isNaN(num) && num >= 1 && num <= youtubeFeeds.length) {
       feedToRemove = youtubeFeeds[num - 1];
     } else {
-      feedToRemove = youtubeFeeds.find(feed => feed === input);
+      feedToRemove = youtubeFeeds.find((feed) => feed === input);
     }
 
     if (!feedToRemove) {
       await ctx.reply(
         '❌ Канал не найден. Проверьте номер или введите полную RSS-ссылку.\n\n' +
-        'Используйте "📋 Список YouTube", чтобы увидеть доступные каналы.',
+          'Используйте "📋 Список YouTube", чтобы увидеть доступные каналы.',
         youtubeMenu
       );
       return;
@@ -376,15 +407,20 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu, userId) {
 }
 
 // ---------- RSS функции (для сайтов, не YouTube) ----------
+// Возвращает только собственные RSS-ленты пользователя (без YouTube).
+// Системные ленты (таблица system_feeds) в user_feeds не хранятся и здесь не появляются.
 async function getRssFeeds(userId) {
   const feeds = await db.getUserFeeds(userId);
-  const youtubePrefix = config.YOUTUBE_RSS_SERVICE_URL;
-  return feeds.filter(feed => !feed.startsWith(youtubePrefix));
+  const youtubePrefix = getYouTubeServiceUrl();
+  return feeds.filter((feed) => !feed.startsWith(youtubePrefix));
 }
 
+// Возвращает массив объектов { url } — оставлено для совместимости с handlers.js.
+// Поле fromEnv упразднено: системные ленты теперь живут в отдельной таблице system_feeds
+// и в интерфейсе обычного пользователя/админа не отображаются.
 async function getRssFeedsWithMeta(userId) {
   const dbFeeds = await getRssFeeds(userId);
-  return dbFeeds.map(feed => ({ url: feed, fromEnv: false }));
+  return dbFeeds.map((feed) => ({ url: feed }));
 }
 
 async function addRssFeed(ctx, url, rssMenu, userId) {
@@ -426,18 +462,19 @@ async function removeRssFeed(ctx, input, rssMenu, userId) {
     if (!isNaN(num) && num >= 1 && num <= dbFeeds.length) {
       feedToRemove = dbFeeds[num - 1];
     } else {
-      feedToRemove = dbFeeds.find(feed => feed === input);
+      feedToRemove = dbFeeds.find((feed) => feed === input);
     }
 
     if (!feedToRemove) {
       await ctx.reply(
         '❌ Лента не найдена. Проверьте номер или введите полный URL.\n\n' +
-        'Используйте "📋 Список RSS", чтобы увидеть доступные ленты.',
+          'Используйте "📋 Список RSS", чтобы увидеть доступные ленты.',
         rssMenu
       );
       return;
     }
 
+    // Защиты системных лент здесь больше нет — они не хранятся в user_feeds.
     await db.removeUserFeed(userId, feedToRemove);
     await ctx.reply(`✅ RSS-лента удалена.`, rssMenu);
     botLogger.info(`🗑️ Пользователь ${userId} удалил RSS: ${feedToRemove}`);
@@ -448,15 +485,22 @@ async function removeRssFeed(ctx, input, rssMenu, userId) {
 }
 
 module.exports = {
+  // утилиты
+  getYouTubeServiceUrl,
+  getSystemFeedUrls,
+  // каналы
   addChannelSimple,
   removeChannelSimple,
+  // отправка / пересылка
   sendMessageToTargetChannels,
   forwardMessageFromChannel,
+  // YouTube
   getYouTubeFeeds,
   updateAllFeeds,
   isValidYouTubeUrl,
   handleAddYouTube,
   handleYouTubeRemove,
+  // RSS
   getRssFeeds,
   getRssFeedsWithMeta,
   addRssFeed,
