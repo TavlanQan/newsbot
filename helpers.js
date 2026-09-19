@@ -220,7 +220,12 @@ function extractChannelIdentifier(input) {
 
     const hostname = url.hostname.toLowerCase();
 
-    if (hostname !== 'youtube.com' && hostname !== 'www.youtube.com') {
+    // Поддерживаем youtube.com, www.youtube.com, m.youtube.com
+    if (
+      hostname !== 'youtube.com' &&
+      hostname !== 'www.youtube.com' &&
+      hostname !== 'm.youtube.com'
+    ) {
       return null;
     }
 
@@ -230,7 +235,16 @@ function extractChannelIdentifier(input) {
       url.pathname.startsWith('/channel/') ||
       url.pathname.startsWith('/c/')
     ) {
-      return url.toString();
+      // FIX: убираем query-параметры (?si=, ?feature=share, ?pp=, ?t=...)
+      // и hash — микросервису они не нужны, а в БД создают «фантомные»
+      // дубликаты одного и того же канала.
+      url.search = '';
+      url.hash = '';
+
+      let result = url.toString();
+      // FIX: убираем trailing slash, чтобы /@name и /@name/ давали один URL
+      if (result.endsWith('/')) result = result.slice(0, -1);
+      return result;
     }
 
     // Видео не является каналом.
@@ -256,7 +270,13 @@ function isValidYouTubeUrl(input) {
   try {
     const url = new URL(trimmed);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    const validHosts = ['youtube.com', 'www.youtube.com', 'youtu.be', 'www.youtu.be'];
+    const validHosts = [
+      'youtube.com',
+      'www.youtube.com',
+      'm.youtube.com',
+      'youtu.be',
+      'www.youtu.be'
+    ];
     if (!validHosts.includes(url.hostname)) return false;
     if (url.hostname === 'youtu.be' || url.hostname === 'www.youtu.be') {
       return url.pathname.length > 1;
@@ -269,6 +289,47 @@ function isValidYouTubeUrl(input) {
     );
   } catch {
     return false;
+  }
+}
+
+// ---------- Хелперы для канонизации YouTube-фидов ----------
+
+// Извлекает UC ID из RSS-ответа микросервиса.
+// Микросервис всегда кладёт в <channel><link> канонический UC-URL:
+//   <link>https://www.youtube.com/channel/UC6NxANDfwFCWqRSfW-3e2WQ</link>
+// Если найти не удалось — вернёт null.
+function extractUcIdFromRssXml(xml) {
+  if (typeof xml !== 'string') return null;
+  // Ищем <link>https://www.youtube.com/channel/UCxxxxx</link>
+  // (именно в channel-секции, но тег <link> в items выглядит как watch?v=...,
+  //  поэтому регексп на /channel/UC... не зацепит video-ссылки).
+  const match = xml.match(
+    /<link>https?:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})<\/link>/
+  );
+  return match ? match[1] : null;
+}
+
+// Проверяет, хранится ли фид в каноническом виде (?channel=UCxxxx).
+// Легаси-фиды (?channel=https://youtube.com/@handle) возвращают false.
+function isCanonicalYouTubeFeedUrl(feedUrl) {
+  try {
+    const u = new URL(feedUrl);
+    const ch = u.searchParams.get('channel') || '';
+    return /^UC[\w-]{22}$/.test(ch);
+  } catch {
+    return false;
+  }
+}
+
+// Резолвит UC ID для уже сохранённого фида через микросервис.
+// Нужно для проверки дублей: пользователь добавляет @handle, а в БД
+// уже лежит тот же канал под другим @handle (или под старым URL с ?si=).
+async function findExistingUcIdForFeed(feedUrl) {
+  try {
+    const resp = await axios.get(feedUrl, { timeout: 5000 });
+    return extractUcIdFromRssXml(resp.data);
+  } catch {
+    return null;
   }
 }
 
@@ -319,8 +380,9 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
     const testUrl = `${serviceUrl}?channel=${encodeURIComponent(channelId)}`;
     botLogger.info(`Проверяем RSS-генерацию для канала: ${testUrl}`);
 
+    let response;
     try {
-      const response = await axios.get(testUrl, { timeout: 5000 });
+      response = await axios.get(testUrl, { timeout: 5000 });
       if (typeof response.data === 'string' && response.data.includes('Ошибка определения канала')) {
         await ctx.reply(
           '❌ Микросервис не смог распознать этот канал.\n' +
@@ -344,24 +406,63 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       throw error;
     }
 
-    // Формируем полный URL для RSS-ленты
-    const finalUrl = `${serviceUrl}?channel=${encodeURIComponent(channelId)}`;
+    // FIX: достаём канонический UC ID из ответа микросервиса.
+    // Микросервис принимает и handle, и UC ID, а возвращает всегда UC ID в <link>.
+    // Это позволяет хранить один и тот же канал в БД под единым URL,
+    // независимо от того, как пользователь его добавил (@taulanq / @TaulanSalpagarov-m6m / UCxxx).
+    const resolvedUcId = extractUcIdFromRssXml(response.data);
+    const canonicalChannelId = resolvedUcId || channelId;
+
+    if (resolvedUcId && resolvedUcId !== channelId) {
+      botLogger.info(`🔍 Handle ${channelId} разрешён в UC ID: ${resolvedUcId}`);
+    }
+
+    // Формируем канонический URL для RSS-ленты
+    const canonicalUrl = `${serviceUrl}?channel=${encodeURIComponent(canonicalChannelId)}`;
+
+    // FIX: проверяем дубликаты не только по точному URL, но и по UC ID
     const feeds = await db.getUserFeeds(userId);
-    if (feeds.includes(finalUrl)) {
+
+    // 1) Прямая проверка канонического URL
+    if (feeds.includes(canonicalUrl)) {
       await ctx.reply('ℹ️ Этот YouTube канал уже отслеживается.', youtubeMenu);
       return;
     }
 
-    await db.addUserFeed(userId, finalUrl);
+    // 2) Если добавили через handle — проверяем легаси-фиды (сохранённые как ?channel=https://...).
+    //    Резолвим их UC ID и сравниваем. Медленно, но таких фидов мало.
+    if (resolvedUcId) {
+      const legacyYouTubeFeeds = feeds.filter((f) => {
+        if (!f.startsWith(serviceUrl)) return false;
+        return !isCanonicalYouTubeFeedUrl(f);
+      });
+
+      for (const legacyFeed of legacyYouTubeFeeds) {
+        const existingUcId = await findExistingUcIdForFeed(legacyFeed);
+        if (existingUcId === resolvedUcId) {
+          await ctx.reply(
+            `ℹ️ Этот YouTube канал уже отслеживается.\n\n` +
+              `Сохранён под старой ссылкой:\n${legacyFeed}\n\n` +
+              `Если хотите обновить на каноническую — удалите старую через «🗑️ Удалить YouTube» и добавьте заново.`,
+            youtubeMenu
+          );
+          return;
+        }
+      }
+    }
+
+    await db.addUserFeed(userId, canonicalUrl);
 
     await ctx.reply(
       '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
-        `📡 RSS-ссылка: ${finalUrl}\n` +
-        `🔑 Идентификатор: ${channelId}\n\n` +
+        `📡 RSS-ссылка: ${canonicalUrl}\n` +
+        `🔑 Идентификатор: ${canonicalChannelId}\n\n` +
         'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
       youtubeMenu
     );
-    botLogger.info(`📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${finalUrl}`);
+    botLogger.info(
+      `📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${canonicalUrl}`
+    );
   } catch (error) {
     errorHandler.handleError(error, 'helpers.js: handleAddYouTube');
     await ctx.reply(
@@ -398,6 +499,11 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu, userId) {
     }
 
     await db.removeUserFeed(userId, feedToRemove);
+    // FIX: чистим feed_state. При повторном добавлении фид заново пройдёт
+    // сидирование — иначе, если первый парсинг был по пустому фиду,
+    // при повторном добавлении все накопившиеся записи ушли бы флудом.
+    await db.removeFeedState(userId, feedToRemove).catch(() => {});
+
     await ctx.reply(`✅ YouTube-канал удалён.`, youtubeMenu);
     botLogger.info(`🗑️ Пользователь ${userId} удалил YouTube: ${feedToRemove}`);
   } catch (error) {
@@ -476,6 +582,10 @@ async function removeRssFeed(ctx, input, rssMenu, userId) {
 
     // Защиты системных лент здесь больше нет — они не хранятся в user_feeds.
     await db.removeUserFeed(userId, feedToRemove);
+    // FIX: чистим feed_state, чтобы при повторном добавлении фид
+    // заново сидировался (см. handleYouTubeRemove для деталей).
+    await db.removeFeedState(userId, feedToRemove).catch(() => {});
+
     await ctx.reply(`✅ RSS-лента удалена.`, rssMenu);
     botLogger.info(`🗑️ Пользователь ${userId} удалил RSS: ${feedToRemove}`);
   } catch (error) {

@@ -36,24 +36,40 @@ async function checkFeedForUser(userId, feedUrl, bot) {
       if (parseCache) parseCache.set(feedUrl, feed);
     }
 
-    if (!feed || !feed.items || feed.items.length === 0) return;
-
-    // 2. Ключевые слова и цели — если нет, не тратим время
+    // 2. Ключевые слова и цели — если нет, не тратим время.
+    //    ВАЖНО: проверяем ДО feed_state, чтобы не создавать состояние
+    //    для пользователя, который всё равно ничего не получит.
     const keywords = await db.getKeywords(userId);
     if (keywords.length === 0) return;
 
     const targets = await db.getTargetChannels(userId);
     if (targets.length === 0) return;
 
-    // 3. Берём верхние N записей
+    // 3. Проверяем состояние фида (видели ли мы его когда-либо у этого пользователя).
+    //    FIX: эту проверку делаем ДО проверки на пустоту — иначе пустой фид
+    //    никогда не выйдет из режима сидирования: при первом парсинге
+    //    feed_state не создастся, а при появлении первой записи она
+    //    будет засеянена как «уже виденная» и не отправится.
+    const seenBefore = await db.hasFeedState(userId, feedUrl);
+    const feedIsEmpty = !feed || !feed.items || feed.items.length === 0;
+
+    if (feedIsEmpty) {
+      if (!seenBefore) {
+        await db.initFeedState(userId, feedUrl);
+        rssLogger.debug(
+          `📭 Фид пуст при первом парсинге, инициализирован: user=${userId}, feed=${feedUrl}`
+        );
+      }
+      return;
+    }
+
+    // 4. Берём верхние N записей
     const items = feed.items.slice(0, ITEMS_PER_FEED);
     if (items.length === 0) return;
 
-    // 4. Проверяем, видели ли мы уже этот фид у этого пользователя.
-    //    Если нет — это первый запуск после добавления фида.
-    //    Сидируем: помечаем все записи как «уже виденные» БЕЗ отправки.
-    //    Защищает от заваливания пользователя историей канала.
-    const seenBefore = await db.hasFeedState(userId, feedUrl);
+    // 5. Первый парсинг непустого фида — сидируем.
+    //    Помечаем все текущие записи как «уже виденные» БЕЗ отправки,
+    //    чтобы не заваливать пользователя историей канала при добавлении.
     if (!seenBefore) {
       const links = items.map((i) => i.link).filter(Boolean);
       await db.markRssItemsSentBulk(userId, feedUrl, links);
@@ -64,7 +80,7 @@ async function checkFeedForUser(userId, feedUrl, bot) {
       return;
     }
 
-    // 5. Основной проход.
+    // 6. Основной проход.
     //    Дедуп по (userId, item_link) глобальный — если та же ссылка
     //    пришла из другого фида (например, эквивалентного YouTube-хендла),
     //    она уже помечена и не отправится повторно.
@@ -131,7 +147,7 @@ async function checkFeedForUser(userId, feedUrl, bot) {
       }
     }
 
-    // 6. Помечаем все просмотренные записи как «виденные» в БД.
+    // 7. Помечаем все просмотренные записи как «виденные» в БД.
     //    Делаем это ДО того, как очередь отработает — если бот упадёт,
     //    запись не будет считаться непрочитанной. Trade-off в пользу
     //    «лучше пропустить, чем зафлудить».
