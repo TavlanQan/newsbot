@@ -39,6 +39,28 @@ const monitoredChannelsMenu = Markup.keyboard([
   ['⬅️ Назад']
 ]).resize();
 
+// ---------- Тексты, при нажатии которых FSM сбрасывается ----------
+// Это кнопки главного/подменю, которые открывают новый контекст.
+// Если пользователь был в середине FSM-диалога (например, вводил keyword)
+// и нажал такую кнопку — незавершённое состояние должно исчезнуть,
+// иначе следующее текстовое сообщение уйдёт в старый FSM-обработчик.
+//
+// FSM-стартовые кнопки («➕ Добавить …») здесь НЕ перечислены: их
+// обработчики сами вызывают setState() и перезаписывают состояние.
+const STATE_RESET_TEXTS = new Set([
+  '⬅️ Назад',
+  '📈 Статистика',
+  '🗝️ Ключевые слова',
+  '🎯 Целевые каналы',
+  '📡 Мониторинг каналов',
+  '📺 YouTube каналы',
+  '📡 RSS ленты',
+  '🔄 Запустить пересылку',
+  '⏹️ Остановить пересылку',
+  '📋 Список YouTube',
+  '📋 Список RSS'
+]);
+
 // ---------- Админ-меню (inline, динамическое) ----------
 function getAdminMenu(isMain) {
   const rows = [
@@ -119,8 +141,31 @@ async function isAdmin(userId) {
 function registerHandlers(deps) {
   const { bot, userStates, isForwardingActive } = deps;
 
+  // ---------- Единая точка записи FSM ----------
+  // Всегда сохраняем timestamp — иначе очистка в bot.js (setInterval,
+  // 30 мин) никогда не сработает: она проверяет именно stateData.timestamp.
+  // Без этого поля userStates превращается в монотонную утечку.
+  const setState = (userId, state) =>
+    userStates.set(userId, { state, timestamp: Date.now() });
+
+  const clearState = (userId) => userStates.delete(userId);
+
+  // ---------- Middleware: сброс FSM при нажатии кнопок меню ----------
+  // Регистрируется первым, поэтому срабатывает ДО bot.hears('...').
+  // Мы намеренно не полагаемся на то, что каждый обработчик сам вызовет
+  // clearState — это слишком легко забыть при добавлении новой кнопки.
+  bot.use((ctx, next) => {
+    if (ctx.message && typeof ctx.message.text === 'string' && ctx.from) {
+      if (STATE_RESET_TEXTS.has(ctx.message.text)) {
+        userStates.delete(ctx.from.id);
+      }
+    }
+    return next();
+  });
+
   // ---------- Команда /start ----------
   bot.start(async (ctx) => {
+    clearState(ctx.from.id);
     const ok = await ensureUser(ctx);
     if (!ok) return;
     await ctx.reply(
@@ -133,6 +178,7 @@ function registerHandlers(deps) {
   // ---------- Команда /admin (только для админов) ----------
   bot.command('admin', async (ctx) => {
     const userId = ctx.from.id;
+    clearState(userId);
     if (!(await isAdmin(userId))) {
       await ctx.reply('⛔ У вас нет прав администратора.');
       return;
@@ -143,6 +189,12 @@ function registerHandlers(deps) {
   // ---------- Обработка inline-кнопок админ-меню ----------
   bot.action(/admin_.*/, async (ctx) => {
     const userId = ctx.from.id;
+    // Любое действие внутри админ-панели начинает новый сценарий —
+    // сбрасываем незавершённый FSM. Это закрывает сценарий:
+    // admin_add_sub → клик admin_back → user пишет «привет» →
+    // старый обработчик пытается распарсить «привет» как ID.
+    clearState(userId);
+
     if (!(await isAdmin(userId))) {
       await ctx.answerCbQuery('⛔ Нет прав');
       return;
@@ -172,7 +224,7 @@ function registerHandlers(deps) {
           'Пример: <code>123456789 30</code>',
         { parse_mode: 'HTML', ...menu }
       );
-      userStates.set(userId, { state: 'admin_waiting_add_sub' });
+      setState(userId, 'admin_waiting_add_sub');
       return;
     }
 
@@ -182,7 +234,7 @@ function registerHandlers(deps) {
           'Пример: <code>123456789</code>',
         { parse_mode: 'HTML', ...menu }
       );
-      userStates.set(userId, { state: 'admin_waiting_remove_user' });
+      setState(userId, 'admin_waiting_remove_user');
       return;
     }
 
@@ -244,7 +296,7 @@ function registerHandlers(deps) {
         await ctx.answerCbQuery('⛔ Только главный админ');
         return;
       }
-      userStates.set(userId, { state: 'admin_waiting_promote' });
+      setState(userId, 'admin_waiting_promote');
       await ctx.editMessageText(
         '👑 Введите ID пользователя, которому нужно назначить права админа.\n' +
           'Пользователь должен уже хотя бы раз запустить бота.\n\n' +
@@ -259,7 +311,7 @@ function registerHandlers(deps) {
         await ctx.answerCbQuery('⛔ Только главный админ');
         return;
       }
-      userStates.set(userId, { state: 'admin_waiting_demote' });
+      setState(userId, 'admin_waiting_demote');
       await ctx.editMessageText(
         '🔻 Введите ID администратора для снятия прав.\n' +
           'С главного админа права снять нельзя.\n\n' +
@@ -329,7 +381,7 @@ function registerHandlers(deps) {
       return;
     }
     await ctx.answerCbQuery();
-    userStates.set(userId, { state: 'admin_waiting_sysfeed_add' });
+    setState(userId, 'admin_waiting_sysfeed_add');
     await ctx.editMessageText(
       '✏️ Введите URL системной RSS-ленты.\n' +
         'Пример: <code>https://example.com/rss.xml</code>\n\n' +
@@ -345,7 +397,7 @@ function registerHandlers(deps) {
       return;
     }
     await ctx.answerCbQuery();
-    userStates.set(userId, { state: 'admin_waiting_sysfeed_remove' });
+    setState(userId, 'admin_waiting_sysfeed_remove');
     await ctx.editMessageText(
       '✏️ Введите номер или полный URL системной RSS-ленты для удаления.\n\n' +
         'Сначала посмотрите список через «📋 Список системных RSS».\n' +
@@ -457,6 +509,7 @@ function registerHandlers(deps) {
   });
 
   // ---------- Назад в главное меню ----------
+  // FSM уже сброшен middleware'ом (STATE_RESET_TEXTS содержит '⬅️ Назад').
   bot.hears('⬅️ Назад', async (ctx) => {
     const ok = await ensureUser(ctx);
     if (!ok) return;
@@ -474,7 +527,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_youtube_link' });
+    setState(userId, 'waiting_for_youtube_link');
     await ctx.reply(
       '📺 Отправьте ссылку на YouTube канал\n\n' +
         'Поддерживаются форматы:\n' +
@@ -519,7 +572,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_youtube_remove' });
+    setState(userId, 'waiting_for_youtube_remove');
     await ctx.reply(
       '🗑️ Введите номер YouTube-канала для удаления.\n\n' +
         'Сначала посмотрите список командой "📋 Список YouTube".\n' +
@@ -539,7 +592,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_rss_add' });
+    setState(userId, 'waiting_for_rss_add');
     await ctx.reply(
       '📡 Введите URL RSS-ленты сайта (например, https://example.com/rss.xml).\n\n' +
         'Отправьте "Отмена", чтобы отменить действие.'
@@ -572,7 +625,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_rss_remove' });
+    setState(userId, 'waiting_for_rss_remove');
     await ctx.reply(
       '🗑️ Введите номер или полный URL RSS-ленты для удаления.\n\n' +
         'Сначала посмотрите список командой "📋 Список RSS".\n' +
@@ -626,7 +679,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_keyword_add' });
+    setState(userId, 'waiting_for_keyword_add');
     await ctx.reply('✏️ Введите ключевое слово для добавления (можно несколько через запятую или пробел):');
   });
 
@@ -634,7 +687,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_keyword_remove' });
+    setState(userId, 'waiting_for_keyword_remove');
     await ctx.reply('🗑️ Введите ключевое слово для удаления (можно несколько через запятую или пробел):');
   });
 
@@ -659,7 +712,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_target_channel_add' });
+    setState(userId, 'waiting_for_target_channel_add');
     await ctx.reply('✏️ Введите ID целевого канала (например: -1001234567890):');
   });
 
@@ -667,7 +720,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_target_channel_remove' });
+    setState(userId, 'waiting_for_target_channel_remove');
     await ctx.reply('🗑️ Введите ID целевого канала для удаления:');
   });
 
@@ -692,7 +745,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_monitored_channel_add' });
+    setState(userId, 'waiting_for_monitored_channel_add');
     await ctx.reply('✏️ Введите ID канала для отслеживания (например: -1001234567890):');
   });
 
@@ -700,7 +753,7 @@ function registerHandlers(deps) {
     const ok = await ensureUser(ctx);
     if (!ok) return;
     const userId = ctx.from.id;
-    userStates.set(userId, { state: 'waiting_for_monitored_channel_remove' });
+    setState(userId, 'waiting_for_monitored_channel_remove');
     await ctx.reply('🗑️ Введите ID отслеживаемого канала для удаления:');
   });
 
@@ -783,7 +836,7 @@ function registerHandlers(deps) {
     try {
       // Отмена действия
       if (text.toLowerCase() === 'отмена' && state) {
-        userStates.delete(userId);
+        clearState(userId);
         let returnMenu = mainMenu;
         if (state === 'waiting_for_youtube_link' || state === 'waiting_for_youtube_remove') {
           returnMenu = youtubeMenu;
@@ -806,25 +859,25 @@ function registerHandlers(deps) {
       // ---------- Состояния пользователей ----------
       if (state === 'waiting_for_youtube_link') {
         await helpers.handleAddYouTube(ctx, text, youtubeMenu, userId);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'waiting_for_youtube_remove') {
         await helpers.handleYouTubeRemove(ctx, text, youtubeMenu, userId);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'waiting_for_rss_add') {
         await helpers.addRssFeed(ctx, text, rssMenu, userId);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'waiting_for_rss_remove') {
         await helpers.removeRssFeed(ctx, text, rssMenu, userId);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -839,7 +892,7 @@ function registerHandlers(deps) {
 
         if (keywordsList.length === 0) {
           await ctx.reply('❌ Вы не ввели ни одного ключевого слова.', keywordsMenu);
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
@@ -855,7 +908,7 @@ function registerHandlers(deps) {
         let reply = `✅ Добавлено ключевых слов: ${addedCount}`;
         if (existsCount > 0) reply += `, уже существовали: ${existsCount}`;
         await ctx.reply(reply, keywordsMenu);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -870,7 +923,7 @@ function registerHandlers(deps) {
 
         if (keywordsToRemove.length === 0) {
           await ctx.reply('❌ Вы не ввели ни одного ключевого слова для удаления.', keywordsMenu);
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
@@ -897,20 +950,20 @@ function registerHandlers(deps) {
         if (notFoundCount > 0) reply += `, не найдено: ${notFoundCount}`;
         if (removedList.length > 0) reply += `\nУдалены: ${removedList.join(', ')}`;
         await ctx.reply(reply, keywordsMenu);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'waiting_for_target_channel_add') {
         const result = await helpers.addChannelSimple(userId, text, 'target');
-        userStates.delete(userId);
+        clearState(userId);
         await ctx.reply(result.message, targetChannelsMenu);
         return;
       }
 
       if (state === 'waiting_for_monitored_channel_add') {
         const result = await helpers.addChannelSimple(userId, text, 'monitored');
-        userStates.delete(userId);
+        clearState(userId);
         await ctx.reply(result.message, monitoredChannelsMenu);
         return;
       }
@@ -923,7 +976,7 @@ function registerHandlers(deps) {
           { targetChannelsMenu, monitoredChannelsMenu },
           userId
         );
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -935,7 +988,7 @@ function registerHandlers(deps) {
           { targetChannelsMenu, monitoredChannelsMenu },
           userId
         );
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -943,7 +996,7 @@ function registerHandlers(deps) {
       if (state === 'admin_waiting_add_sub') {
         if (!(await isAdmin(userId))) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         const parts = text.split(' ');
@@ -963,14 +1016,14 @@ function registerHandlers(deps) {
             : `❌ Пользователь ${targetUserId} не найден.`,
           getAdminMenu(isMainAdmin(userId))
         );
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'admin_waiting_remove_user') {
         if (!(await isAdmin(userId))) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         const targetUserId = parseInt(text);
@@ -985,14 +1038,14 @@ function registerHandlers(deps) {
             : `❌ Пользователь ${targetUserId} не найден.`,
           getAdminMenu(isMainAdmin(userId))
         );
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'admin_waiting_promote') {
         if (!isMainAdmin(userId)) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         const targetUserId = parseInt(text, 10);
@@ -1006,7 +1059,7 @@ function registerHandlers(deps) {
             '❌ Пользователь не найден. Он должен хотя бы раз запустить /start.',
             adminsSubMenu
           );
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         await db.setAdmin(targetUserId, true);
@@ -1015,14 +1068,14 @@ function registerHandlers(deps) {
           { parse_mode: 'HTML', ...adminsSubMenu }
         );
         botLogger.info(`👑 Пользователь ${targetUserId} назначен админом (кем: ${userId})`);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'admin_waiting_demote') {
         if (!isMainAdmin(userId)) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         const targetUserId = parseInt(text, 10);
@@ -1032,7 +1085,7 @@ function registerHandlers(deps) {
         }
         if (isMainAdmin(targetUserId)) {
           await ctx.reply('❌ Нельзя снять права с главного администратора.', adminsSubMenu);
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
         await db.setAdmin(targetUserId, false);
@@ -1041,7 +1094,7 @@ function registerHandlers(deps) {
           { parse_mode: 'HTML', ...adminsSubMenu }
         );
         botLogger.info(`🔻 Пользователь ${targetUserId} лишён прав админа (кем: ${userId})`);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -1049,7 +1102,7 @@ function registerHandlers(deps) {
       if (state === 'admin_waiting_sysfeed_add') {
         if (!isMainAdmin(userId)) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
@@ -1065,28 +1118,28 @@ function registerHandlers(deps) {
         const existing = await db.getSystemFeeds();
         if (existing.includes(url)) {
           await ctx.reply('ℹ️ Эта системная лента уже добавлена.', systemFeedsMenu);
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
         await db.addSystemFeed(url);
         await ctx.reply(`✅ Системная RSS-лента добавлена:\n${url}`, systemFeedsMenu);
         botLogger.info(`🌐 Главный админ добавил системную ленту: ${url}`);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
       if (state === 'admin_waiting_sysfeed_remove') {
         if (!isMainAdmin(userId)) {
           await ctx.reply('⛔ Нет прав.');
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
         const feeds = await db.getSystemFeeds();
         if (feeds.length === 0) {
           await ctx.reply('❌ Нет системных RSS-лент для удаления.', systemFeedsMenu);
-          userStates.delete(userId);
+          clearState(userId);
           return;
         }
 
@@ -1110,7 +1163,7 @@ function registerHandlers(deps) {
         await db.removeSystemFeed(feedToRemove);
         await ctx.reply(`✅ Системная RSS-лента удалена.`, systemFeedsMenu);
         botLogger.info(`🗑️ Главный админ удалил системную ленту: ${feedToRemove}`);
-        userStates.delete(userId);
+        clearState(userId);
         return;
       }
 
@@ -1124,6 +1177,10 @@ function registerHandlers(deps) {
   // ---------- Обработка ошибок бота ----------
   bot.catch((err, ctx) => {
     errorHandler.handleError(err, 'handlers.js: bot.catch');
+    // Сбрасываем FSM, иначе пользователь застрянет в состоянии до рестарта.
+    if (ctx && ctx.from && ctx.from.id) {
+      userStates.delete(ctx.from.id);
+    }
     ctx.reply('❌ Произошла внутренняя ошибка. Попробуйте позже.').catch(() => {});
   });
 }
