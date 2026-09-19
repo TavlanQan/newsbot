@@ -1,11 +1,8 @@
 # Секреты — не коммитить
 .env
 
-# SQLite (WAL)
-news_bot.db
-news_bot.db-shm
-news_bot.db-wal
-*.db.bak-*
+# SQLite (WAL) — все вариации (db, db-wal, db-shm, db.bak-*, db.old-*, db.recovered)
+news_bot.db*
 
 # Логи
 logs/

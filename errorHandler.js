@@ -3,21 +3,37 @@ const { botLogger } = require('./utils/logger');
 
 // Паттерны, которые считаем «ожидаемыми» сбоями — они идут в warn, а не в error.
 // Всё, что не подходит ни под один паттерн, считается настоящей ошибкой.
+//
 // Классифицируем ТОЛЬКО по error.message (короткая, осмысленная строка),
 // а не по stack — иначе результат будет случайным.
+//
+// ВАЖНО: список намеренно узкий. Каждый паттерн должен быть специфичным.
+// Если добавить голое '429' — оно сматчит "line 429", "user 429123",
+// "429 items failed" и любой другой текст с этой подстрокой. Аналогично
+// 'status code 4' ловит 400/401/403/404 — а это чаще всего реальные баги
+// (неверный chat_id, отозванный токен, удалённый канал), которые
+// должны попадать в error, а не в warn.
 const WARN_PATTERNS = [
-  'timeout',
+  // Сетевые — обычно временные
   'ETIMEDOUT',
   'ECONNREFUSED',
   'ECONNRESET',
   'ENOTFOUND',
   'EAI_AGAIN',
-  '429',
-  'Too Many Requests',
   'socket hang up',
-  'request to', // axios: "Request failed with status code 4xx/5xx"
-  'status code 4',
-  'status code 5'
+  // Rate limit — ожидаемо и восстановимо
+  'status code 429',
+  'HTTP 429',
+  'Too Many Requests',
+  // 5xx удалённых серверов — временные (Telegram, микросервисы).
+  // Регистр разный у разных клиентов: axios/rss-parser отдают "Status code 5xx".
+  'status code 5',
+  'Status code 5',
+  // Умышленно НЕ включены (слишком широкие):
+  //   '429'           — ловит любое вхождение числа
+  //   'status code 4' — ловит 400/401/403/404, это реальные ошибки
+  //   'request to'    — ловит любой axios-fail, включая 4xx
+  //   'timeout'       — слишком общее; ETIMEDOUT покрывает таймауты соединения
 ];
 
 function isWarnLevel(message) {
@@ -36,17 +52,16 @@ function isWarnLevel(message) {
 function handleError(error, context = '', level = null) {
   if (!error) return;
 
-  // Извлекаем короткое сообщение и стек отдельно.
+  // Извлекаем короткое сообщение отдельно от объекта Error.
   // error.message может содержать \n — это допустимо в логах, но не для классификации.
   let shortMessage;
-  let stack;
+  let errorObject = null;
 
   if (error instanceof Error) {
     shortMessage = error.message || String(error);
-    stack = error.stack || null;
+    errorObject = error;
   } else {
     shortMessage = String(error);
-    stack = null;
   }
 
   // Определяем уровень.
@@ -66,20 +81,25 @@ function handleError(error, context = '', level = null) {
     determinedLevel = 'error';
   }
 
-  // Собираем финальное сообщение.
-  // Префикс [context] — гарантирует, что контекст попадёт в лог даже если
-  // winston-формат в utils/logger.js не читает поле context.
+  // Префикс контекста — в message, а НЕ в поле {context}.
+  // Поле {context} перебивает defaultMeta логгера и теряет метку модуля
+  // ([BOT] / [RSS] / [DB]). Наш printf в utils/logger.js рендерит
+  // info.context как есть, поэтому передавать туда context не нужно —
+  // см. комментарий в createLogger().
   const prefixedMessage = context ? `[${context}] ${shortMessage}` : shortMessage;
 
-  // Отправляем в winston. Поля context и stack сохраняем отдельно —
-  // winston запишет их, если формат это поддерживает; иначе они будут проигнорированы,
-  // но prefix в message не даст потерять контекст.
+  // Передаём Error-объект отдельным полем — winston.format.errors({stack:true})
+  // корректно извлечёт .stack и добавит его к логу. Если передавать stack
+  // строкой в payload.stack, формат его проигнорирует (он ищет Error),
+  // и стек попадёт в лог только потому, что printf рендерит info.stack как есть.
+  // Явный Error надёжнее и не сломается при рефакторинге формата.
   const payload = {
     level: determinedLevel,
     message: prefixedMessage,
-    context: context || undefined
   };
-  if (stack) payload.stack = stack;
+  if (errorObject) {
+    payload.error = errorObject;
+  }
 
   botLogger.log(payload);
 }
