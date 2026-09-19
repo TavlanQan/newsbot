@@ -52,13 +52,15 @@ function isWarnLevel(message) {
 function handleError(error, context = '', level = null) {
   if (!error) return;
 
-  // Извлекаем короткое сообщение отдельно от объекта Error.
+  // Извлекаем короткое сообщение и стек.
   // error.message может содержать \n — это допустимо в логах, но не для классификации.
   let shortMessage;
+  let stack = null;
   let errorObject = null;
 
   if (error instanceof Error) {
     shortMessage = error.message || String(error);
+    stack = error.stack || null;
     errorObject = error;
   } else {
     shortMessage = String(error);
@@ -88,15 +90,20 @@ function handleError(error, context = '', level = null) {
   // см. комментарий в createLogger().
   const prefixedMessage = context ? `[${context}] ${shortMessage}` : shortMessage;
 
-  // Передаём Error-объект отдельным полем — winston.format.errors({stack:true})
-  // корректно извлечёт .stack и добавит его к логу. Если передавать stack
-  // строкой в payload.stack, формат его проигнорирует (он ищет Error),
-  // и стек попадёт в лог только потому, что printf рендерит info.stack как есть.
-  // Явный Error надёжнее и не сломается при рефакторинге формата.
+  // Передаём в payload два поля:
+  //  - stack: строка со стеком. Именно её читает printf в utils/logger.js
+  //    (winston.format.errors({stack:true}) здесь НЕ помогает: он извлекает
+  //    stack только из info.message, когда тот является Error — а у нас
+  //    message уже строка с префиксом контекста).
+  //  - error: сам Error-объект. Winston его не рендерит, но сохраняет в info,
+  //    что полезно для будущих JSON-форматов и внешних транспортов.
   const payload = {
     level: determinedLevel,
     message: prefixedMessage,
   };
+  if (stack) {
+    payload.stack = stack;
+  }
   if (errorObject) {
     payload.error = errorObject;
   }
