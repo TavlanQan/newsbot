@@ -1,1 +1,22 @@
-config.js
+# Секреты — не коммитить
+.env
+
+# SQLite (WAL)
+news_bot.db
+news_bot.db-shm
+news_bot.db-wal
+*.db.bak-*
+
+# Логи
+logs/
+*.log
+
+# Node
+node_modules/
+
+# Сессии Telegraf (Задача 1, скоро)
+sessions.json
+
+# OS
+.DS_Store
+Thumbs.db
