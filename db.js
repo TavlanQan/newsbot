@@ -353,6 +353,178 @@ function removeSystemFeed(feedUrl) {
   });
 }
 
+// ------------------- ОТПРАВЛЕННЫЕ RSS-ЗАПИСИ (sent_rss_items) -------------------
+// Замена in-memory lastItemsCache из newsService. Ключ — пара (user_id, item_link),
+// поэтому одна и та же ссылка не будет отправлена пользователю дважды, даже если
+// она пришла из нескольких эквивалентных фидов (например, двух YouTube-хендлов
+// одного и того же канала).
+function ensureSentRssItemsTable() {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `CREATE TABLE IF NOT EXISTS sent_rss_items (
+        user_id   INTEGER NOT NULL,
+        feed_url  TEXT    NOT NULL,
+        item_link TEXT    NOT NULL,
+        sent_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        PRIMARY KEY (user_id, item_link)
+      )`,
+      (err) => {
+        if (err) return reject(err);
+        db.run(
+          `CREATE INDEX IF NOT EXISTS idx_sent_rss_items_sent_at
+           ON sent_rss_items(sent_at)`,
+          (idxErr) => (idxErr ? reject(idxErr) : resolve())
+        );
+      }
+    );
+  });
+}
+
+function isRssItemSent(userId, itemLink) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT 1 FROM sent_rss_items WHERE user_id = ? AND item_link = ? LIMIT 1',
+      [userId, itemLink],
+      (err, row) => (err ? reject(err) : resolve(!!row))
+    );
+  });
+}
+
+function markRssItemSent(userId, feedUrl, itemLink) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT OR IGNORE INTO sent_rss_items (user_id, feed_url, item_link)
+       VALUES (?, ?, ?)`,
+      [userId, feedUrl, itemLink],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      }
+    );
+  });
+}
+
+// Пакетная пометка — используется при сидировании нового фида
+// и при массовом проходе по свежим записям. Ускорено prepared statement.
+function markRssItemsSentBulk(userId, feedUrl, itemLinks) {
+  return new Promise((resolve, reject) => {
+    if (!itemLinks || itemLinks.length === 0) return resolve(0);
+
+    const stmt = db.prepare(
+      'INSERT OR IGNORE INTO sent_rss_items (user_id, feed_url, item_link) VALUES (?, ?, ?)'
+    );
+
+    let pending = itemLinks.length;
+    let errored = false;
+
+    for (const link of itemLinks) {
+      stmt.run([userId, feedUrl, link], (err) => {
+        if (errored) return;
+        if (err) {
+          errored = true;
+          stmt.finalize(() => reject(err));
+          return;
+        }
+        if (--pending === 0) {
+          stmt.finalize((finalizeErr) => {
+            if (finalizeErr) reject(finalizeErr);
+            else resolve(itemLinks.length);
+          });
+        }
+      });
+    }
+  });
+}
+
+// Удаление записей старше N дней. Вызывается из cron в bot.js.
+function cleanOldSentItems(days = 30) {
+  return new Promise((resolve, reject) => {
+    const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+    db.run(
+      'DELETE FROM sent_rss_items WHERE sent_at < ?',
+      [cutoff],
+      function (err) {
+        if (err) reject(err);
+        else {
+          dbLogger.info(`🧹 Удалено старых sent_rss_items: ${this.changes}`);
+          resolve(this.changes);
+        }
+      }
+    );
+  });
+}
+
+// ------------------- СОСТОЯНИЕ ФИДА (feed_state) -------------------
+// Отличает «первый парсинг фида у пользователя» (сидируем без отправки)
+// от последующих (отправляем только новое). Без этой таблицы либо зальём
+// пользователя всей историей при добавлении фида, либо потеряем записи,
+// появившиеся во время простоя.
+function ensureFeedStateTable() {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `CREATE TABLE IF NOT EXISTS feed_state (
+        user_id         INTEGER NOT NULL,
+        feed_url        TEXT    NOT NULL,
+        first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        last_checked_at INTEGER,
+        PRIMARY KEY (user_id, feed_url)
+      )`,
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
+
+function hasFeedState(userId, feedUrl) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT 1 FROM feed_state WHERE user_id = ? AND feed_url = ? LIMIT 1',
+      [userId, feedUrl],
+      (err, row) => (err ? reject(err) : resolve(!!row))
+    );
+  });
+}
+
+function initFeedState(userId, feedUrl) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'INSERT OR IGNORE INTO feed_state (user_id, feed_url) VALUES (?, ?)',
+      [userId, feedUrl],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      }
+    );
+  });
+}
+
+function touchFeedState(userId, feedUrl) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `UPDATE feed_state
+       SET last_checked_at = strftime('%s','now')
+       WHERE user_id = ? AND feed_url = ?`,
+      [userId, feedUrl],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      }
+    );
+  });
+}
+
+function removeFeedState(userId, feedUrl) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'DELETE FROM feed_state WHERE user_id = ? AND feed_url = ?',
+      [userId, feedUrl],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.changes);
+      }
+    );
+  });
+}
+
 // ------------------- ПРОЧЕЕ (для совместимости) -------------------
 // Для проверки дубликатов пересылки (оставляем глобальным)
 function isMessageForwarded(messageId, channelId) {
@@ -428,6 +600,18 @@ module.exports = {
   getSystemFeeds,
   addSystemFeed,
   removeSystemFeed,
+  // отправленные RSS-записи (дедуп)
+  ensureSentRssItemsTable,
+  isRssItemSent,
+  markRssItemSent,
+  markRssItemsSentBulk,
+  cleanOldSentItems,
+  // состояние фида (сидирование)
+  ensureFeedStateTable,
+  hasFeedState,
+  initFeedState,
+  touchFeedState,
+  removeFeedState,
   // пересылка
   isMessageForwarded,
   addForwardedMessage,

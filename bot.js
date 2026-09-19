@@ -128,6 +128,33 @@ async function initDatabase() {
       `CREATE TABLE IF NOT EXISTS settings (
           key   TEXT PRIMARY KEY,
           value TEXT
+      );`,
+      // ---------------------------------------------------------------
+      // Дедуп отправленных RSS-записей. Заменяет in-memory lastItemsCache
+      // из newsService.js: переживает рестарт, устраняет флуд при первом
+      // запуске и дубли между эквивалентными фидами (один YouTube-канал,
+      // два разных URL).
+      // ---------------------------------------------------------------
+      `CREATE TABLE IF NOT EXISTS sent_rss_items (
+          user_id   INTEGER NOT NULL,
+          feed_url  TEXT    NOT NULL,
+          item_link TEXT    NOT NULL,
+          sent_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+          PRIMARY KEY (user_id, item_link)
+      );`,
+      `CREATE INDEX IF NOT EXISTS idx_sent_rss_items_sent_at
+          ON sent_rss_items(sent_at);`,
+      // ---------------------------------------------------------------
+      // Флаг «фид уже инициализирован для пользователя».
+      // Отличает первый парсинг (сидируем без отправки, чтобы не залить
+      // пользователя историей) от последующих (отправляем только новое).
+      // ---------------------------------------------------------------
+      `CREATE TABLE IF NOT EXISTS feed_state (
+          user_id         INTEGER NOT NULL,
+          feed_url        TEXT    NOT NULL,
+          first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+          last_checked_at INTEGER,
+          PRIMARY KEY (user_id, feed_url)
       );`
     ];
 
@@ -297,11 +324,16 @@ async function startBot() {
     cron.schedule(cronExpr, () => runRssCycle('cron'));
     botLogger.info(`✅ Мониторинг RSS настроен: cron="${cronExpr}" (интервал ${intervalMinutes} мин)`);
 
-    // Очистка устаревших записей БД: раз в сутки в 04:00
+    // Очистка устаревших записей БД: раз в сутки в 04:00.
+    // Чистим и forwarded_messages (пересылка из Telegram-каналов),
+    // и sent_rss_items (дедуп RSS) — иначе обе таблицы растут бесконечно.
     cron.schedule('0 4 * * *', async () => {
       try {
-        const removed = await db.cleanOldForwarded(30).catch(() => 0);
-        botLogger.info(`🧹 Очистка БД: forwarded_messages удалено=${removed}`);
+        const removedFwd = await db.cleanOldForwarded(30).catch(() => 0);
+        const removedSent = await db.cleanOldSentItems(30).catch(() => 0);
+        botLogger.info(
+          `🧹 Очистка БД: forwarded_messages удалено=${removedFwd}, sent_rss_items удалено=${removedSent}`
+        );
       } catch (error) {
         errorHandler.handleError(error, 'bot.js: cron.cleanup');
       }

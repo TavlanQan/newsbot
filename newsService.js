@@ -1,6 +1,6 @@
 // newsService.js
 const Parser = require('rss-parser');
-const { botLogger } = require('./utils/logger');
+const { rssLogger } = require('./utils/logger');
 const errorHandler = require('./errorHandler');
 const db = require('./db');
 const queue = require('./queue');
@@ -14,24 +14,20 @@ const parser = new Parser({
   }
 });
 
-// Храним последние проверенные новости для каждого пользователя и фида
-// Ключ: `${userId}:${feedUrl}`, значение: массив { link, title, pubDate }
-//
-// ⚠️ ВАЖНО: кеш хранится в памяти и обнуляется при каждом рестарте бота.
-// После рестарта при первой проверке возможно повторная отправка
-// до 5 свежих записей на каждый фид, если они совпадают с ключевыми словами.
-// Для устранения — вынести в БД (аналог forwarded_messages).
-let lastItemsCache = {};
+// Сколько свежих записей фида просматривать за один цикл.
+// Не 5, как раньше: если бот был недоступен несколько часов, за один цикл
+// должно успеть догнать все накопившиеся. Дедуп через sent_rss_items
+// защищает от повторной отправки, поэтому можно взять больше.
+const ITEMS_PER_FEED = 20;
 
 // Кеш распарсенных лент в рамках одного цикла checkAllFeeds.
-// Позволяет не парсить один и тот же фид несколько раз, если его
-// слушают несколько пользователей. Сбрасывается в null после цикла.
+// Сбрасывается в null после цикла. Между рестартами теряется — это ОК,
+// потому что источник истины о «виденных» записях теперь в БД.
 let parseCache = null;
 
-// Функция проверки одной ленты для одного пользователя
 async function checkFeedForUser(userId, feedUrl, bot) {
   try {
-    // Используем кеш, если он активен (внутри checkAllFeeds)
+    // 1. Парсим фид (с кешем на время цикла)
     let feed;
     if (parseCache && parseCache.has(feedUrl)) {
       feed = parseCache.get(feedUrl);
@@ -42,45 +38,79 @@ async function checkFeedForUser(userId, feedUrl, bot) {
 
     if (!feed || !feed.items || feed.items.length === 0) return;
 
-    // Получаем ключевые слова пользователя
+    // 2. Ключевые слова и цели — если нет, не тратим время
     const keywords = await db.getKeywords(userId);
-    if (keywords.length === 0) {
-      botLogger.debug(`Пользователь ${userId} не имеет ключевых слов, пропускаем`);
-      return;
-    }
+    if (keywords.length === 0) return;
 
-    // Получаем целевые каналы пользователя
     const targets = await db.getTargetChannels(userId);
-    if (targets.length === 0) {
-      botLogger.debug(`Пользователь ${userId} не имеет целевых каналов, пропускаем`);
+    if (targets.length === 0) return;
+
+    // 3. Берём верхние N записей
+    const items = feed.items.slice(0, ITEMS_PER_FEED);
+    if (items.length === 0) return;
+
+    // 4. Проверяем, видели ли мы уже этот фид у этого пользователя.
+    //    Если нет — это первый запуск после добавления фида.
+    //    Сидируем: помечаем все записи как «уже виденные» БЕЗ отправки.
+    //    Защищает от заваливания пользователя историей канала.
+    const seenBefore = await db.hasFeedState(userId, feedUrl);
+    if (!seenBefore) {
+      const links = items.map((i) => i.link).filter(Boolean);
+      await db.markRssItemsSentBulk(userId, feedUrl, links);
+      await db.initFeedState(userId, feedUrl);
+      rssLogger.info(
+        `🌱 Фид инициализирован: user=${userId}, feed=${feedUrl}, помечено записей=${links.length} (без отправки)`
+      );
       return;
     }
 
-    // Берём последние 5 элементов, чтобы не пропустить
-    const items = feed.items.slice(0, 5);
-    const cacheKey = `${userId}:${feedUrl}`;
-    const lastChecked = lastItemsCache[cacheKey] || [];
+    // 5. Основной проход.
+    //    Дедуп по (userId, item_link) глобальный — если та же ссылка
+    //    пришла из другого фида (например, эквивалентного YouTube-хендла),
+    //    она уже помечена и не отправится повторно.
+    let newCount = 0;
+    let matchedCount = 0;
+    const linksToMark = [];
+    const seenInThisCycle = new Set();
 
     for (const item of items) {
-      // Проверяем, не было ли уже отправлено
-      const alreadySent = lastChecked.some((i) => i.link === item.link);
-      if (alreadySent) continue;
+      if (!item.link) continue;
 
-      // Проверяем наличие ключевых слов в заголовке или описании
+      // Защита от дублей внутри одного фида (маловероятно, но бесплатно)
+      if (seenInThisCycle.has(item.link)) continue;
+      seenInThisCycle.add(item.link);
+
+      // Уже отправляли когда-то?
+      const sent = await db.isRssItemSent(userId, item.link);
+      if (sent) continue;
+
+      newCount++;
+
+      // Матчинг по ключевым словам
       const title = (item.title || '').toLowerCase();
       const description = (item.contentSnippet || item.content || '').toLowerCase();
       const fullText = title + ' ' + description;
+      const matched = keywords.some((kw) => fullText.includes(kw.toLowerCase()));
 
-      const matchedKeywords = keywords.filter((kw) => fullText.includes(kw.toLowerCase()));
-      if (matchedKeywords.length === 0) continue;
+      // Помечаем запись как «просмотренную» в любом случае.
+      // Даже если keyword не совпал — чтобы в следующий цикл не проверять
+      // её повторно. Если пользователь позже добавит keyword, старое
+      // не всплывёт — это ожидаемое поведение.
+      linksToMark.push(item.link);
+
+      if (!matched) continue;
+      matchedCount++;
 
       // Формируем сообщение
       let message = `<b>${escapeHtml(item.title || 'Новость')}</b>\n`;
-      if (item.contentSnippet) message += `${escapeHtml(item.contentSnippet.substring(0, 300))}...\n`;
-      if (item.link) message += `<a href="${escapeHtml(item.link)}">Читать далее</a>\n`;
-      message += `\n🔑 Совпавшие ключевые слова: ${escapeHtml(matchedKeywords.join(', '))}`;
+      if (item.contentSnippet) {
+        message += `${escapeHtml(item.contentSnippet.substring(0, 300))}...\n`;
+      }
+      if (item.link) {
+        message += `<a href="${escapeHtml(item.link)}">Читать далее</a>\n`;
+      }
 
-      // Отправляем во все целевые каналы пользователя
+      // Отправляем во все целевые каналы
       for (const target of targets) {
         queue.add(async () => {
           try {
@@ -88,21 +118,33 @@ async function checkFeedForUser(userId, feedUrl, bot) {
               parse_mode: 'HTML',
               disable_web_page_preview: false
             });
-            botLogger.info(
-              `📨 Отправлено пользователю ${userId} в канал ${target.channel_id}: ${item.title}`
+            rssLogger.info(
+              `📨 Отправлено ${userId} → ${target.channel_id}: ${item.title}`
             );
           } catch (err) {
-            errorHandler.handleError(err, `newsService: отправка пользователю ${userId}`);
+            errorHandler.handleError(
+              err,
+              `newsService: отправка ${userId} в ${target.channel_id}`
+            );
           }
         });
       }
-
-      // Добавляем в кеш
-      lastChecked.push({ link: item.link, title: item.title, pubDate: item.pubDate });
-      if (lastChecked.length > 50) lastChecked.shift(); // ограничиваем размер
     }
 
-    lastItemsCache[cacheKey] = lastChecked;
+    // 6. Помечаем все просмотренные записи как «виденные» в БД.
+    //    Делаем это ДО того, как очередь отработает — если бот упадёт,
+    //    запись не будет считаться непрочитанной. Trade-off в пользу
+    //    «лучше пропустить, чем зафлудить».
+    if (linksToMark.length > 0) {
+      await db.markRssItemsSentBulk(userId, feedUrl, linksToMark);
+    }
+    await db.touchFeedState(userId, feedUrl);
+
+    if (newCount > 0) {
+      rssLogger.debug(
+        `📥 ${feedUrl} (user=${userId}): новых=${newCount}, совпало с keywords=${matchedCount}`
+      );
+    }
   } catch (error) {
     errorHandler.handleError(
       error,
@@ -111,28 +153,21 @@ async function checkFeedForUser(userId, feedUrl, bot) {
   }
 }
 
-// Основная функция проверки всех лент всех пользователей
 async function checkAllFeeds(bot) {
-  botLogger.info('🔄 Запуск проверки RSS для всех пользователей...');
+  rssLogger.info('🔄 Запуск проверки RSS для всех пользователей...');
 
   // Инициализируем кеш распарсенных лент на время этого цикла
   parseCache = new Map();
 
   try {
-    // Читаем системные ленты ОДИН раз на весь цикл.
-    // Они применяются ко всем активным пользователям (с дедупликацией против личных фидов).
     const systemFeeds = await db.getSystemFeeds();
 
-    // Читаем всех пользователей. Раньше мы итерировались только по владельцам user_feeds —
-    // это не подходит, потому что системные ленты должны доходить и до тех,
-    // у кого нет личных подписок.
     const allUsers = await db.listUsers();
     if (allUsers.length === 0) {
-      botLogger.info('ℹ️ Нет пользователей — проверка не требуется');
+      rssLogger.info('ℹ️ Нет пользователей — проверка не требуется');
       return;
     }
 
-    // Карта личных фидов: { userId: [feedUrl, ...] }
     const allFeeds = await db.getAllFeeds();
     const userFeedsMap = {};
     for (const row of allFeeds) {
@@ -148,14 +183,11 @@ async function checkAllFeeds(bot) {
 
       const hasSub = await db.hasActiveSubscription(uid);
       if (!hasSub) {
-        // debug, а не info — при большом числе пользователей лог бы засорялся
-        botLogger.debug(`⏭️ Пользователь ${uid} не имеет активной подписки, пропускаем`);
+        rssLogger.debug(`⏭️ Пользователь ${uid} без активной подписки, пропускаем`);
         continue;
       }
 
       const personalFeeds = userFeedsMap[uid] || [];
-      // Set защищает от двойной проверки одного фида, если URL есть
-      // и в личных подписках, и в системных
       const feedsForUser = [...new Set([...personalFeeds, ...systemFeeds])];
 
       if (feedsForUser.length === 0) continue;
@@ -167,26 +199,23 @@ async function checkAllFeeds(bot) {
       }
     }
 
-    botLogger.info(
+    rssLogger.info(
       `📊 Активных пользователей с фидами: ${processedUsers}, ` +
         `всего проверок фидов: ${totalChecks} ` +
         `(системных в наборе: ${systemFeeds.length})`
     );
-    botLogger.info('✅ Проверка RSS завершена');
+    rssLogger.info('✅ Проверка RSS завершена');
   } catch (error) {
     errorHandler.handleError(error, 'newsService: checkAllFeeds');
   } finally {
-    // Сбрасываем кеш — при следующем цикле данные могут измениться
     parseCache = null;
   }
 }
 
-// Функция для ручного запуска (для тестов)
 async function manualCheck(bot) {
   await checkAllFeeds(bot);
 }
 
-// Вспомогательная функция экранирования HTML
 function escapeHtml(text) {
   if (!text) return '';
   return text
@@ -197,7 +226,6 @@ function escapeHtml(text) {
     .replace(/'/g, '&#039;');
 }
 
-// Экспортируем
 module.exports = {
   checkAllFeeds,
   manualCheck
