@@ -157,10 +157,24 @@ async function checkFeedForUser(userId, feedUrl, bot, keywords, targets) {
       }
       message += `<a href="${escapeHtml(itemLink)}">Читать далее</a>\n`;
 
-      // Отправляем во все целевые каналы
+      // Отправляем во все целевые каналы.
+      //
+      // ВАЖНО: задача НЕ обёрнута в try/catch. Ошибка от sendMessage
+      // пробрасывается в queue.js, который сам решает:
+      //   - 429 / 5xx → retry с retry_after (до MAX_ATTEMPTS раз)
+      //   - 4xx (кроме 429) / прочее → окончательный log в errorHandler
+      // Если бы мы ловили ошибку здесь, queue никогда не узнал бы о ней
+      // и не сделал retry — сообщение потерялось бы при транзиентной ошибке.
+      //
+      // Про at-least-once: при retry возможен теоретический дубль (sendMessage
+      // прошёл, но Telegram ответил 5xx после доставки). На практике это
+      // редкий сценарий, и лучше дубль, чем потеря. Дополнительно:
+      // markRssItemsSentBulk вызывается ДО queue (см. шаг 6), поэтому
+      // при краше между постановкой в очередь и отправкой — запись
+      // не будет повторно отправлена со следующего цикла.
       for (const target of targets) {
-        queue.add(async () => {
-          try {
+        queue.add(
+          async () => {
             await bot.telegram.sendMessage(target.channel_id, message, {
               parse_mode: 'HTML',
               disable_web_page_preview: false
@@ -168,13 +182,11 @@ async function checkFeedForUser(userId, feedUrl, bot, keywords, targets) {
             rssLogger.info(
               `📨 Отправлено ${userId} → ${target.channel_id}: ${item.title}`
             );
-          } catch (err) {
-            errorHandler.handleError(
-              err,
-              `newsService: отправка ${userId} в ${target.channel_id}`
-            );
+          },
+          {
+            context: `newsService: sendMessage → ${target.channel_id} (user=${userId}, item="${item.title || ''}")`
           }
-        });
+        );
       }
     }
 

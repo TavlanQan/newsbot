@@ -5,6 +5,7 @@ const db = require('./db');
 const config = require('./config');
 const newsService = require('./newsService');
 const helpers = require('./helpers');
+const queue = require('./queue');
 const { botLogger } = require('./utils/logger');
 const errorHandler = require('./errorHandler');
 const { registerHandlers } = require('./handlers');
@@ -121,15 +122,58 @@ async function migrateSystemFeeds() {
 }
 
 // ---------- Завершение работы ----------
-async function shutdown() {
-  botLogger.info('🔴 Завершение работы бота...');
+// Порядок важен:
+//   1. bot.stop() — Telegraf перестаёт принимать новые updates.
+//      После этого новые queue.add(...) из handlers.js уже не приходят.
+//   2. queue.drain() — ждём слива очереди до 10 сек. Новые задачи
+//      (в том числе от ещё бегущего checkAllFeeds) отклоняются: у них
+//      closing=true. Это осознанный trade-off — предсказуемый shutdown
+//      важнее, чем «дожать всё любой ценой».
+//   3. exit(0).
+//
+// kill-timeout в PM2 должен быть > drain timeout, иначе SIGKILL прилетит
+// раньше, чем мы закончим. У нас drain=10000, kill-timeout=15000.
+//
+// Защита от повторного вызова (SIGINT + SIGTERM подряд) через
+// isShuttingDown — иначе два параллельных drain'а будут драться за exit.
+let isShuttingDown = false;
+async function shutdown(signalLabel = 'SIGTERM') {
+  if (isShuttingDown) {
+    botLogger.info(`⚠️ shutdown уже выполняется, повторный ${signalLabel} игнорируется`);
+    return;
+  }
+  isShuttingDown = true;
+
+  botLogger.info(`🔴 Завершение работы бота (${signalLabel})...`);
+
+  // 1. Останавливаем Telegraf. Даже если упадёт — всё равно пробуем drain.
   try {
     await bot.stop();
-    process.exit(0);
+    botLogger.info('✅ Telegraf остановлен');
   } catch (error) {
-    errorHandler.handleError(error, 'bot.js: shutdown');
-    process.exit(1);
+    errorHandler.handleError(error, 'bot.js: shutdown → bot.stop');
   }
+
+  // 2. Ждём слива очереди.
+  try {
+    const result = await queue.drain(10000);
+    if (result.drained) {
+      botLogger.info('✅ Очередь слита');
+    } else {
+      botLogger.warn(
+        `⚠️ Очередь не слита за 10 сек: remaining=${result.remaining}, ` +
+          `stillProcessing=${result.stillProcessing}. ` +
+          `Незавершённые задачи потеряются при exit.`
+      );
+    }
+  } catch (error) {
+    errorHandler.handleError(error, 'bot.js: shutdown → queue.drain');
+  }
+
+  // 3. Выход. Всегда 0 — это плановое завершение по сигналу,
+  //    PM2 перезапустит процесс штатно.
+  botLogger.info('👋 Выход');
+  process.exit(0);
 }
 
 // ---------- Периодическая очистка userStates ----------
@@ -274,9 +318,9 @@ startBot();
 
 process.once('SIGINT', () => {
   botLogger.info('⏹️ Остановка бота по SIGINT');
-  shutdown();
+  shutdown('SIGINT');
 });
 process.once('SIGTERM', () => {
   botLogger.info('⏹️ Остановка бота по SIGTERM');
-  shutdown();
+  shutdown('SIGTERM');
 });

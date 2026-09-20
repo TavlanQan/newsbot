@@ -146,6 +146,19 @@ async function removeChannelSimple(ctx, userText, type, menus, userId) {
 // ---------- Функции отправки и пересылки (с user_id) ----------
 // Возвращает true сразу после постановки задач в очередь — это НЕ значит,
 // что все сообщения уже доставлены. Реальная отправка асинхронна (см. queue.js).
+//
+// ВАЖНО: задачи НЕ обёрнуты в try/catch. Ошибка из sendMessage/forwardMessage
+// пробрасывается наверх в queue.js, который сам решает:
+//   - 429 / 5xx → retry с retry_after (до MAX_ATTEMPTS раз, cap MAX_CUMULATIVE_WAIT_MS)
+//   - 4xx (кроме 429) / прочее → окончательный log в errorHandler
+// Если бы мы ловили ошибку здесь, queue никогда не узнал бы о ней и не сделал retry.
+//
+// Что касается forwardMessageFromChannel и идемпотентности:
+// при retry возможен теоретический дубль (forward прошёл, но 5xx от Telegram
+// или упал addForwardedMessage → queue повторяет → forward идёт снова).
+// На практике: 5xx от Telegram с успешной обработкой — редкость, а
+// addForwardedMessage — локальная SQLite (не даёт HTTP-кодов). Принимаем
+// at-least-once семантику: лучше дубль в редком случае, чем потеря сообщения.
 async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
   try {
     const targetChannels = await db.getTargetChannels(userId);
@@ -155,8 +168,8 @@ async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
     }
 
     for (const targetChannel of targetChannels) {
-      queue.add(async () => {
-        try {
+      queue.add(
+        async () => {
           await bot.telegram.sendMessage(targetChannel.channel_id, message, {
             parse_mode: 'HTML',
             disable_web_page_preview: false,
@@ -165,13 +178,9 @@ async function sendMessageToTargetChannels(bot, userId, message, options = {}) {
           botLogger.info(
             `✅ Отправлено сообщение в канал ${targetChannel.channel_id} (пользователь ${userId})`
           );
-        } catch (error) {
-          errorHandler.handleError(
-            error,
-            `helpers.js: sendMessageToTargetChannels (queue task for ${targetChannel.channel_id})`
-          );
-        }
-      });
+        },
+        { context: `helpers.js: sendMessage → ${targetChannel.channel_id} (user=${userId})` }
+      );
     }
     return true;
   } catch (error) {
@@ -195,20 +204,16 @@ async function forwardMessageFromChannel(bot, userId, channelId, messageId) {
       return;
     }
     for (const targetChannel of targetChannels) {
-      queue.add(async () => {
-        try {
+      queue.add(
+        async () => {
           await bot.telegram.forwardMessage(targetChannel.channel_id, channelId, messageId);
           await db.addForwardedMessage(messageId, channelId);
           botLogger.info(
             `📤 Переслано сообщение ${messageId} → ${targetChannel.channel_id} (пользователь ${userId})`
           );
-        } catch (error) {
-          errorHandler.handleError(
-            error,
-            `helpers.js: forwardMessageFromChannel (queue task for ${targetChannel.channel_id})`
-          );
-        }
-      });
+        },
+        { context: `helpers.js: forwardMessage → ${targetChannel.channel_id} (user=${userId}, msg=${messageId})` }
+      );
     }
   } catch (error) {
     errorHandler.handleError(error, 'helpers.js: forwardMessageFromChannel (outer)');
