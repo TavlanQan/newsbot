@@ -16,6 +16,7 @@ const mainMenu = Markup.keyboard([
 
 const youtubeMenu = Markup.keyboard([
   ['📺 Добавить YouTube', '📋 Список YouTube'],
+  ['✏️ Задать название'],
   ['🗑️ Удалить YouTube', '⬅️ Назад']
 ]).resize();
 
@@ -45,8 +46,9 @@ const monitoredChannelsMenu = Markup.keyboard([
 // и нажал такую кнопку — незавершённое состояние должно исчезнуть,
 // иначе следующее текстовое сообщение уйдёт в старый FSM-обработчик.
 //
-// FSM-стартовые кнопки («➕ Добавить …») здесь НЕ перечислены: их
-// обработчики сами вызывают setState() и перезаписывают состояние.
+// FSM-стартовые кнопки («➕ Добавить …», «✏️ Задать название») здесь
+// НЕ перечислены: их обработчики сами вызывают setState() и перезаписывают
+// состояние.
 const STATE_RESET_TEXTS = new Set([
   '⬅️ Назад',
   '📈 Статистика',
@@ -545,27 +547,45 @@ function registerHandlers(deps) {
     if (!ok) return;
     const userId = ctx.from.id;
     try {
-      const youtubeFeeds = await helpers.getYouTubeFeeds(userId);
-      if (youtubeFeeds.length === 0) {
+      const feeds = await helpers.getYouTubeFeedsWithMeta(userId);
+      if (feeds.length === 0) {
         await ctx.reply('📺 Нет добавленных YouTube-каналов.', youtubeMenu);
         return;
       }
       let message = '📋 <b>Список YouTube-каналов:</b>\n\n';
-      youtubeFeeds.forEach((feed, index) => {
-        try {
-          const url = new URL(feed);
-          const channelParam = url.searchParams.get('channel') || feed;
-          message += `${index + 1}. ${channelParam}\n`;
-        } catch {
-          message += `${index + 1}. ${feed}\n`;
-        }
+      feeds.forEach((f, index) => {
+        const title = f.feedTitle
+          ? helpers.escapeHtml(f.feedTitle)
+          : '— без названия —';
+        const id = f.ucId
+          ? helpers.escapeHtml(f.ucId)
+          : helpers.escapeHtml(f.feedUrl);
+        message += `${index + 1}. ${title}\n   <code>${id}</code>\n`;
       });
-      message += '\nДля удаления используйте кнопку "🗑️ Удалить YouTube" и введите номер канала.';
+      message +=
+        '\nДля удаления используйте кнопку "🗑️ Удалить YouTube" и введите номер канала.';
       await ctx.reply(message, { parse_mode: 'HTML' });
     } catch (error) {
       errorHandler.handleError(error, 'handlers.js: hears "Список YouTube"');
       await ctx.reply('❌ Ошибка при получении списка YouTube-каналов.', youtubeMenu);
     }
+  });
+
+  // ---------- Ручное задание названия YouTube-канала ----------
+  // FSM-стартовая кнопка. НЕ добавляем в STATE_RESET_TEXTS — обработчик
+  // сам вызывает setState() и перезаписывает любое предыдущее состояние.
+  bot.hears('✏️ Задать название', async (ctx) => {
+    const ok = await ensureUser(ctx);
+    if (!ok) return;
+    const userId = ctx.from.id;
+    setState(userId, 'waiting_for_youtube_title');
+    await ctx.reply(
+      '✏️ Введите номер канала и новое название через пробел.\n\n' +
+        'Пример: <code>1 Alan Elni Bilgileri</code>\n\n' +
+        'Посмотреть номера каналов можно через «📋 Список YouTube».\n' +
+        'Отправьте "Отмена", чтобы отменить действие.',
+      { parse_mode: 'HTML', ...youtubeMenu }
+    );
   });
 
   bot.hears('🗑️ Удалить YouTube', async (ctx) => {
@@ -838,7 +858,11 @@ function registerHandlers(deps) {
       if (text.toLowerCase() === 'отмена' && state) {
         clearState(userId);
         let returnMenu = mainMenu;
-        if (state === 'waiting_for_youtube_link' || state === 'waiting_for_youtube_remove') {
+        if (
+          state === 'waiting_for_youtube_link' ||
+          state === 'waiting_for_youtube_remove' ||
+          state === 'waiting_for_youtube_title'
+        ) {
           returnMenu = youtubeMenu;
         } else if (state === 'waiting_for_rss_add' || state === 'waiting_for_rss_remove') {
           returnMenu = rssMenu;
@@ -865,6 +889,12 @@ function registerHandlers(deps) {
 
       if (state === 'waiting_for_youtube_remove') {
         await helpers.handleYouTubeRemove(ctx, text, youtubeMenu, userId);
+        clearState(userId);
+        return;
+      }
+
+      if (state === 'waiting_for_youtube_title') {
+        await helpers.handleSetYouTubeTitle(ctx, text, youtubeMenu, userId);
         clearState(userId);
         return;
       }

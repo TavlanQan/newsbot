@@ -51,6 +51,32 @@ function getSystemFeedUrls() {
   return [];
 }
 
+// ---------- Утилиты для текста (XML/HTML сущности) ----------
+// Простой unescape XML/HTML-сущностей для текста, извлечённого из RSS.
+// Порядок важен: &amp; раскрывается ПОСЛЕДНИМ, иначе "&amp;lt;" даст "&lt;"
+// вместо "<".
+function unescapeXmlBasic(s) {
+  if (typeof s !== 'string') return s;
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+// Экранирование для безопасного вывода в Telegram с parse_mode:'HTML'.
+// Названия YouTube-каналов и RSS-фидов могут содержать &, <, > — без
+// экранирования Telegram отклонит сообщение с ошибкой 400 Bad Request.
+function escapeHtml(s) {
+  if (typeof s !== 'string') return '';
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 // ---------- Общие функции для каналов (с user_id) ----------
 async function addChannelSimple(userId, channelIdentifier, channelType) {
   try {
@@ -196,6 +222,34 @@ async function getYouTubeFeeds(userId) {
   return feeds.filter((feed) => feed.startsWith(youtubePrefix));
 }
 
+// Аналог getYouTubeFeeds, но с метаданными: [{feedUrl, feedTitle, ucId}, ...].
+// Порядок тот же, что и у getYouTubeFeeds — обе читают из user_feeds без
+// ORDER BY, стабильно по rowid. Значит нумерация в «Список YouTube»
+// и в «Удалить YouTube» совпадает.
+//
+// ucId может быть null для легаси-фидов (?channel=https://...), тогда
+// вызывающий код должен показать сам feed_url.
+async function getYouTubeFeedsWithMeta(userId) {
+  const feeds = await db.getUserFeedsWithMeta(userId);
+  const youtubePrefix = getYouTubeServiceUrl();
+  return feeds
+    .filter((f) => f.feed_url.startsWith(youtubePrefix))
+    .map((f) => {
+      let ucId = null;
+      try {
+        const u = new URL(f.feed_url);
+        ucId = u.searchParams.get('channel') || null;
+      } catch {
+        /* битый URL — ucId останется null, покажем feed_url */
+      }
+      return {
+        feedUrl: f.feed_url,
+        feedTitle: f.feed_title || null,
+        ucId
+      };
+    });
+}
+
 async function updateAllFeeds(userId, newFeedsArray) {
   const currentFeeds = await db.getUserFeeds(userId);
   for (const feed of currentFeeds) {
@@ -309,6 +363,27 @@ function extractUcIdFromRssXml(xml) {
   return match ? match[1] : null;
 }
 
+// Извлекает название канала из RSS-ответа микросервиса.
+// Микросервис кладёт в <channel><title> чистое название (см. generateRSS
+// в yt_rss/index.js: title = channelTitle || channelId). Items идут позже,
+// поэтому первый <title> в XML — это именно title канала.
+//
+// Возвращает null, если title не найден, пуст или равен fallback-UC ID.
+function extractChannelTitleFromRssXml(xml) {
+  if (typeof xml !== 'string') return null;
+  const match = xml.match(/<title>([\s\S]*?)<\/title>/i);
+  if (!match) return null;
+
+  let title = unescapeXmlBasic(match[1]).trim();
+  if (!title) return null;
+
+  // Отсекаем случай, когда вместо названия подставлен fallback-UC ID
+  // (см. generateRSS в yt_rss/index.js: title: channelTitle || channelId).
+  if (/^UC[\w-]{22}$/.test(title)) return null;
+
+  return title;
+}
+
 // Проверяет, хранится ли фид в каноническом виде (?channel=UCxxxx).
 // Легаси-фиды (?channel=https://youtube.com/@handle) возвращают false.
 function isCanonicalYouTubeFeedUrl(feedUrl) {
@@ -406,15 +481,25 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       throw error;
     }
 
-    // FIX: достаём канонический UC ID из ответа микросервиса.
+    // FIX: достаём канонический UC ID и название канала из ответа микросервиса.
     // Микросервис принимает и handle, и UC ID, а возвращает всегда UC ID в <link>.
     // Это позволяет хранить один и тот же канал в БД под единым URL,
     // независимо от того, как пользователь его добавил (@taulanq / @TaulanSalpagarov-m6m / UCxxx).
+    // Title извлекается из того же XML — дополнительных запросов к YouTube API нет.
     const resolvedUcId = extractUcIdFromRssXml(response.data);
+    const channelTitle = extractChannelTitleFromRssXml(response.data);
     const canonicalChannelId = resolvedUcId || channelId;
 
     if (resolvedUcId && resolvedUcId !== channelId) {
       botLogger.info(`🔍 Handle ${channelId} разрешён в UC ID: ${resolvedUcId}`);
+    }
+
+    if (channelTitle) {
+      botLogger.info(`📺 Извлечён title канала: "${channelTitle}"`);
+    } else {
+      botLogger.warn(
+        `⚠️ Не удалось извлечь title из RSS для ${canonicalChannelId} — пользователь сможет задать вручную`
+      );
     }
 
     // Формируем канонический URL для RSS-ленты
@@ -451,17 +536,33 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
       }
     }
 
-    await db.addUserFeed(userId, canonicalUrl);
+    // Сохраняем с title (может быть null — тогда пользователь задаст вручную)
+    await db.addUserFeed(userId, canonicalUrl, channelTitle);
 
-    await ctx.reply(
-      '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
-        `📡 RSS-ссылка: ${canonicalUrl}\n` +
-        `🔑 Идентификатор: ${canonicalChannelId}\n\n` +
-        'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
-      youtubeMenu
-    );
+    if (channelTitle) {
+      await ctx.reply(
+        '✅ YouTube канал успешно добавлен в мониторинг!\n\n' +
+          `📺 Название: <b>${escapeHtml(channelTitle)}</b>\n` +
+          `📡 RSS-ссылка: ${canonicalUrl}\n` +
+          `🔑 Идентификатор: ${canonicalChannelId}\n\n` +
+          'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
+        { parse_mode: 'HTML', ...youtubeMenu }
+      );
+    } else {
+      await ctx.reply(
+        '✅ YouTube канал добавлен, но название получить не удалось.\n\n' +
+          `📡 RSS-ссылка: ${canonicalUrl}\n` +
+          `🔑 Идентификатор: ${canonicalChannelId}\n\n` +
+          'Название можно задать вручную — кнопка «✏️ Задать название»\n' +
+          'в меню «📺 YouTube каналы».\n\n' +
+          'Новости будут приходить в целевые каналы, если совпадут с ключевыми словами.',
+        youtubeMenu
+      );
+    }
+
     botLogger.info(
-      `📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${canonicalUrl}`
+      `📺 Пользователь ${userId} добавил YouTube: ${cleanedInput} -> ${canonicalUrl}` +
+        (channelTitle ? ` ("${channelTitle}")` : '')
     );
   } catch (error) {
     errorHandler.handleError(error, 'helpers.js: handleAddYouTube');
@@ -509,6 +610,71 @@ async function handleYouTubeRemove(ctx, input, youtubeMenu, userId) {
   } catch (error) {
     errorHandler.handleError(error, 'helpers.js: handleYouTubeRemove');
     await ctx.reply('❌ Ошибка при удалении YouTube-канала.', youtubeMenu);
+  }
+}
+
+// ---------- Ручное задание названия YouTube-канала ----------
+// Формат ввода: "<номер> <название>" — номер и название через пробел.
+// Название может содержать пробелы (берём всё после первого пробела).
+// Порядок нумерации совпадает с «📋 Список YouTube» (см. getYouTubeFeedsWithMeta).
+async function handleSetYouTubeTitle(ctx, input, youtubeMenu, userId) {
+  try {
+    const feeds = await getYouTubeFeedsWithMeta(userId);
+    if (feeds.length === 0) {
+      await ctx.reply('📺 Нет добавленных YouTube-каналов.', youtubeMenu);
+      return;
+    }
+
+    // \s+ — несколько пробелов тоже ок; s-флаг — .+ матчит переводы строк
+    const match = input.match(/^(\d+)\s+(.+)$/s);
+    if (!match) {
+      await ctx.reply(
+        '❌ Неверный формат.\n\n' +
+          'Введите номер канала и новое название через пробел.\n' +
+          'Пример: <code>1 Alan Elni Bilgileri</code>\n\n' +
+          'Посмотреть номера можно через «📋 Список YouTube».',
+        { parse_mode: 'HTML', ...youtubeMenu }
+      );
+      return;
+    }
+
+    const num = parseInt(match[1], 10);
+    const newTitle = match[2].trim();
+
+    if (num < 1 || num > feeds.length) {
+      await ctx.reply(
+        `❌ Номер должен быть от 1 до ${feeds.length}.`,
+        youtubeMenu
+      );
+      return;
+    }
+
+    if (!newTitle) {
+      await ctx.reply('❌ Название не может быть пустым.', youtubeMenu);
+      return;
+    }
+
+    const target = feeds[num - 1];
+    const updated = await db.updateUserFeedTitle(userId, target.feedUrl, newTitle);
+
+    if (!updated) {
+      await ctx.reply(
+        '❌ Не удалось обновить название — фид не найден в БД.',
+        youtubeMenu
+      );
+      return;
+    }
+
+    await ctx.reply(
+      `✅ Название обновлено:\n<b>${escapeHtml(newTitle)}</b>`,
+      { parse_mode: 'HTML', ...youtubeMenu }
+    );
+    botLogger.info(
+      `✏️ Пользователь ${userId} задал title для ${target.feedUrl}: "${newTitle}"`
+    );
+  } catch (error) {
+    errorHandler.handleError(error, 'helpers.js: handleSetYouTubeTitle');
+    await ctx.reply('❌ Ошибка при обновлении названия.', youtubeMenu);
   }
 }
 
@@ -598,6 +764,7 @@ module.exports = {
   // утилиты
   getYouTubeServiceUrl,
   getSystemFeedUrls,
+  escapeHtml,
   // каналы
   addChannelSimple,
   removeChannelSimple,
@@ -606,10 +773,12 @@ module.exports = {
   forwardMessageFromChannel,
   // YouTube
   getYouTubeFeeds,
+  getYouTubeFeedsWithMeta,
   updateAllFeeds,
   isValidYouTubeUrl,
   handleAddYouTube,
   handleYouTubeRemove,
+  handleSetYouTubeTitle,
   // RSS
   getRssFeeds,
   getRssFeedsWithMeta,

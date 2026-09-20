@@ -1,4 +1,3 @@
-// bot.js
 const { Telegraf } = require('telegraf');
 const cron = require('node-cron');
 const db = require('./db');
@@ -305,6 +304,28 @@ async function startBot() {
 
     await initDatabase();
     botLogger.info('✅ База данных инициализирована (таблицы созданы)');
+
+    // ---------------------------------------------------------------
+    // Идемпотентная миграция: добавляет колонку user_feeds.feed_title,
+    // если её ещё нет. Вызывается через модуль db (у него своё соединение,
+    // независимое от initDatabase), поэтому не конфликтует с закрытием
+    // локального соединения.
+    //
+    // При первом запуске после деплоя: колонка добавляется, в лог идёт
+    // строка «🔄 Миграция: ...». При повторных запусках — тихо, ALTER
+    // вернёт ошибку 'duplicate column name', которую db.js глотает.
+    //
+    // Без этого вызова getYouTubeFeedsWithMeta / addUserFeed(3 арг) /
+    // updateUserFeedTitle упадут с 'no such column: feed_title'.
+    // ---------------------------------------------------------------
+    try {
+      const titleAdded = await db.migrateUserFeedsAddTitle();
+      if (titleAdded) {
+        botLogger.info('🔄 Миграция: добавлена колонка user_feeds.feed_title');
+      }
+    } catch (error) {
+      errorHandler.handleError(error, 'bot.js: migrateUserFeedsAddTitle');
+    }
 
     await bootstrapAdmins();
     await migrateSystemFeeds();

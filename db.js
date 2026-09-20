@@ -272,10 +272,14 @@ function getMonitoredChannels(userId) {
 }
 
 // ------------------- RSS/YouTube ЛЕНТЫ (user_feeds) -------------------
-function addUserFeed(userId, feedUrl) {
+// feed_title — человекочитаемое название фида (для YouTube-каналов это
+// название канала, полученное из RSS-ответа микросервиса или заданное
+// вручную пользователем). Может быть NULL — для фидов, добавленных до
+// миграции, или для обычных RSS, где название не извлекается.
+function addUserFeed(userId, feedUrl, feedTitle = null) {
   return new Promise((resolve, reject) => {
-    const sql = 'INSERT OR IGNORE INTO user_feeds (user_id, feed_url) VALUES (?, ?)';
-    db.run(sql, [userId, feedUrl], function (err) {
+    const sql = 'INSERT OR IGNORE INTO user_feeds (user_id, feed_url, feed_title) VALUES (?, ?, ?)';
+    db.run(sql, [userId, feedUrl, feedTitle], function (err) {
       if (err) reject(err);
       else resolve(this.changes > 0);
     });
@@ -296,6 +300,58 @@ function getUserFeeds(userId) {
     db.all('SELECT feed_url FROM user_feeds WHERE user_id = ?', [userId], (err, rows) => {
       if (err) reject(err);
       else resolve(rows.map(r => r.feed_url));
+    });
+  });
+}
+
+// Возвращает фиды вместе с названиями: [{feed_url, feed_title}, ...].
+// Порядок тот же, что и у getUserFeeds (без ORDER BY — стабильно по rowid).
+function getUserFeedsWithMeta(userId) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      'SELECT feed_url, feed_title FROM user_feeds WHERE user_id = ?',
+      [userId],
+      (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      }
+    );
+  });
+}
+
+// Ручное обновление названия фида (кнопка «✏️ Задать название» для YouTube).
+// Возвращает true, если строка была обновлена (фид существует у пользователя).
+function updateUserFeedTitle(userId, feedUrl, feedTitle) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'UPDATE user_feeds SET feed_title = ? WHERE user_id = ? AND feed_url = ?',
+      [feedTitle, userId, feedUrl],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.changes > 0);
+      }
+    );
+  });
+}
+
+// Идемпотентная миграция: добавляет колонку feed_title в user_feeds,
+// если её ещё нет. SQLite не поддерживает ADD COLUMN IF NOT EXISTS,
+// поэтому глотаем только ошибку 'duplicate column name' (норма при
+// повторных запусках бота). Любую другую ошибку пробрасываем — это
+// может быть реальная проблема со схемой.
+//
+// Возвращает true, если колонка была добавлена (первый запуск),
+// false — если уже существовала.
+function migrateUserFeedsAddTitle() {
+  return new Promise((resolve, reject) => {
+    db.run('ALTER TABLE user_feeds ADD COLUMN feed_title TEXT', (err) => {
+      if (err) {
+        if (String(err.message).includes('duplicate column name')) {
+          return resolve(false); // колонка уже есть — это норма
+        }
+        return reject(err);
+      }
+      resolve(true); // колонка добавлена
     });
   });
 }
@@ -594,6 +650,9 @@ module.exports = {
   addUserFeed,
   removeUserFeed,
   getUserFeeds,
+  getUserFeedsWithMeta,
+  updateUserFeedTitle,
+  migrateUserFeedsAddTitle,
   getAllFeeds,
   // системные ленты
   ensureSystemFeedsTable,
