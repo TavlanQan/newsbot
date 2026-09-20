@@ -536,7 +536,6 @@ function registerHandlers(deps) {
         '• https://www.youtube.com/@ChannelName\n' +
         '• https://www.youtube.com/c/ChannelName\n' +
         '• https://www.youtube.com/channel/UCxxxx\n' +
-        '• https://youtu.be/xxxxxx\n' +
         '• UCxxxxxxxxxxxxxxxxxxxxx\n\n' +
         'Отправьте "Отмена", чтобы отменить действие.'
     );

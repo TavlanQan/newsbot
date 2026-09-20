@@ -313,28 +313,27 @@ function extractChannelIdentifier(input) {
 }
 
 // ---------- Улучшенная валидация YouTube-ссылок ----------
+// Валидирует URL канала YouTube. Поддерживаются только youtube.com /
+// www.youtube.com / m.youtube.com и «голый» UC ID длиной ровно 22 символа
+// (совпадает с extractChannelIdentifier — иначе пользователь с UC+23
+// получит сбивающую с толку ошибку на следующем шаге).
+//
+// Сокращатель youtu.be НЕ поддерживается: extractChannelIdentifier его
+// всё равно отвергает, а раньше isValidYouTubeUrl его пропускал — это
+// давало противоречивое поведение и мусорные подсказки.
 function isValidYouTubeUrl(input) {
   if (typeof input !== 'string') return false;
   const trimmed = input.trim();
   if (!trimmed) return false;
 
-  // Прямой channel ID (UC...)
-  if (/^UC[\w-]{22,}$/.test(trimmed)) return true;
+  // Прямой channel ID (UC...). Ровно 22 символа после UC.
+  if (/^UC[\w-]{22}$/.test(trimmed)) return true;
 
   try {
     const url = new URL(trimmed);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    const validHosts = [
-      'youtube.com',
-      'www.youtube.com',
-      'm.youtube.com',
-      'youtu.be',
-      'www.youtu.be'
-    ];
+    const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com'];
     if (!validHosts.includes(url.hostname)) return false;
-    if (url.hostname === 'youtu.be' || url.hostname === 'www.youtu.be') {
-      return url.pathname.length > 1;
-    }
     return (
       url.pathname.startsWith('/@') ||
       url.pathname.startsWith('/c/') ||
@@ -350,15 +349,15 @@ function isValidYouTubeUrl(input) {
 
 // Извлекает UC ID из RSS-ответа микросервиса.
 // Микросервис всегда кладёт в <channel><link> канонический UC-URL:
-//   <link>https://www.youtube.com/channel/UC6NxANDfwFCWqRSfW-3e2WQ</link>
+//   <link>https://www.youtube.com/channel/UC6NxANDfwWCQfRSfW-3e2WQ</link>
 // Если найти не удалось — вернёт null.
 function extractUcIdFromRssXml(xml) {
   if (typeof xml !== 'string') return null;
-  // Ищем <link>https://www.youtube.com/channel/UCxxxxx</link>
-  // (именно в channel-секции, но тег <link> в items выглядит как watch?v=...,
-  //  поэтому регексп на /channel/UC... не зацепит video-ссылки).
+  // www. — опционально: сейчас микросервис отдаёт ссылку с www, но не
+  // хотим зависеть от этого формата. Если YouTube/пакет rss поменяет
+  // каноническую ссылку — регексп не должен отвалиться.
   const match = xml.match(
-    /<link>https?:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})<\/link>/
+    /<link>https?:\/\/(?:www\.)?youtube\.com\/channel\/(UC[\w-]{22})<\/link>/
   );
   return match ? match[1] : null;
 }
@@ -421,7 +420,6 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
           '• https://www.youtube.com/@ChannelName\n' +
           '• https://www.youtube.com/c/ChannelName\n' +
           '• https://www.youtube.com/channel/UCxxxx\n' +
-          '• https://youtu.be/xxxxxx\n' +
           '• UCxxxxxxxxxxxxxxxxxxxxx',
         youtubeMenu
       );
@@ -492,6 +490,17 @@ async function handleAddYouTube(ctx, input, youtubeMenu, userId) {
 
     if (resolvedUcId && resolvedUcId !== channelId) {
       botLogger.info(`🔍 Handle ${channelId} разрешён в UC ID: ${resolvedUcId}`);
+    }
+
+    // Если микросервис вернул RSS без канонического <link>.../channel/UC...,
+    // канонизация молча выключается: в БД попадёт неканонический URL,
+    // и дедуп по UC ID работать не будет. Логируем warning — иначе этот
+    // сценарий диагностируется только по косвенным признакам (дубли в списке).
+    if (!resolvedUcId) {
+      botLogger.warn(
+        `⚠️ Не удалось извлечь UC ID из RSS для ${channelId}. ` +
+          `Сохраняем как есть — канонизация не сработала, возможны дубли.`
+      );
     }
 
     if (channelTitle) {
