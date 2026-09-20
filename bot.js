@@ -1,3 +1,4 @@
+// bot.js
 const { Telegraf } = require('telegraf');
 const cron = require('node-cron');
 const db = require('./db');
@@ -7,7 +8,6 @@ const helpers = require('./helpers');
 const { botLogger } = require('./utils/logger');
 const errorHandler = require('./errorHandler');
 const { registerHandlers } = require('./handlers');
-const sqlite3 = require('sqlite3').verbose();
 
 // Маркер загрузки файла в PM2 stdout. Если этого лога нет после
 // `pm2 restart newsbot` — значит PM2 запускает НЕ ЭТОТ файл.
@@ -18,41 +18,28 @@ const userStates = new Map();
 
 // ---------- Персистентный флаг «пересылка активна» ----------
 // Значение хранится в БД (таблица settings) и восстанавливается при старте.
-// `handlers.js` продолжает писать `isForwardingActive.value = true/false` —
+// handlers.js продолжает писать isForwardingActive.value = true/false —
 // это работает через Proxy, запись в БД происходит прозрачно.
-const DB_FILE = config.DB_PATH || './news_bot.db';
-
+//
+// Раньше этот файл открывал собственное соединение к sqlite3 ради
+// settings — теперь всё идёт через единый модуль db.js.
 async function loadForwardingState() {
-  return new Promise((resolve) => {
-    const dbLocal = new sqlite3.Database(DB_FILE);
-    dbLocal.get(
-      `SELECT value FROM settings WHERE key = 'forwarding_active'`,
-      (err, row) => {
-        dbLocal.close();
-        if (err) {
-          botLogger.warn(`⚠️ Не удалось прочитать forwarding_active: ${err.message}. По умолчанию — ВКЛ.`);
-          return resolve(true); // безопасный дефолт: лучше цикл, чем тишина
-        }
-        if (!row) return resolve(true); // первый запуск — включаем по умолчанию
-        resolve(row.value === '1');
-      }
+  try {
+    const value = await db.getSetting('forwarding_active');
+    if (value === null || value === undefined) {
+      return true; // первый запуск — включаем по умолчанию
+    }
+    return value === '1';
+  } catch (err) {
+    botLogger.warn(
+      `⚠️ Не удалось прочитать forwarding_active: ${err.message}. По умолчанию — ВКЛ.`
     );
-  });
+    return true; // безопасный дефолт: лучше цикл, чем тишина
+  }
 }
 
 async function saveForwardingState(value) {
-  return new Promise((resolve, reject) => {
-    const dbLocal = new sqlite3.Database(DB_FILE);
-    dbLocal.run(
-      `INSERT INTO settings (key, value) VALUES ('forwarding_active', ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      [value ? '1' : '0'],
-      (err) => {
-        dbLocal.close();
-        err ? reject(err) : resolve();
-      }
-    );
-  });
+  return db.setSetting('forwarding_active', value ? '1' : '0');
 }
 
 // Proxy вместо объекта — set на .value автоматически сохраняет в БД.
@@ -68,116 +55,6 @@ const isForwardingActive = new Proxy(_forwardingStore, {
     return true;
   }
 });
-
-// ---------- Инициализация БД ----------
-async function initDatabase() {
-  return new Promise((resolve, reject) => {
-    const dbLocal = new sqlite3.Database(DB_FILE);
-    dbLocal.run('PRAGMA journal_mode = WAL;');
-
-    const queries = [
-      `CREATE TABLE IF NOT EXISTS users (
-          user_id INTEGER PRIMARY KEY,
-          subscription_end INTEGER,
-          is_admin INTEGER DEFAULT 0,
-          created_at INTEGER DEFAULT (strftime('%s', 'now'))
-      );`,
-      `CREATE TABLE IF NOT EXISTS keywords (
-          user_id INTEGER,
-          keyword TEXT,
-          PRIMARY KEY (user_id, keyword)
-      );`,
-      `CREATE TABLE IF NOT EXISTS monitored_channels (
-          user_id INTEGER,
-          channel_id TEXT,
-          channel_username TEXT,
-          channel_title TEXT,
-          PRIMARY KEY (user_id, channel_id)
-      );`,
-      `CREATE TABLE IF NOT EXISTS target_channels (
-          user_id INTEGER,
-          channel_id TEXT,
-          channel_username TEXT,
-          channel_title TEXT,
-          PRIMARY KEY (user_id, channel_id)
-      );`,
-      `CREATE TABLE IF NOT EXISTS user_feeds (
-          user_id INTEGER,
-          feed_url TEXT,
-          PRIMARY KEY (user_id, feed_url)
-      );`,
-      `CREATE TABLE IF NOT EXISTS system_feeds (
-          feed_url TEXT PRIMARY KEY,
-          added_at INTEGER DEFAULT (strftime('%s','now'))
-      );`,
-      `CREATE TABLE IF NOT EXISTS forwarded_messages (
-          message_id INTEGER,
-          channel_id TEXT,
-          timestamp INTEGER DEFAULT (strftime('%s', 'now')),
-          PRIMARY KEY (message_id, channel_id)
-      );`,
-      `CREATE TABLE IF NOT EXISTS access_requests (
-          user_id      INTEGER PRIMARY KEY,
-          username     TEXT,
-          first_name   TEXT,
-          requested_at INTEGER DEFAULT (strftime('%s', 'now')),
-          status       TEXT DEFAULT 'pending'
-      );`,
-      // Таблица для персистентного состояния бота
-      `CREATE TABLE IF NOT EXISTS settings (
-          key   TEXT PRIMARY KEY,
-          value TEXT
-      );`,
-      // ---------------------------------------------------------------
-      // Дедуп отправленных RSS-записей. Заменяет in-memory lastItemsCache
-      // из newsService.js: переживает рестарт, устраняет флуд при первом
-      // запуске и дубли между эквивалентными фидами (один YouTube-канал,
-      // два разных URL).
-      // ---------------------------------------------------------------
-      `CREATE TABLE IF NOT EXISTS sent_rss_items (
-          user_id   INTEGER NOT NULL,
-          feed_url  TEXT    NOT NULL,
-          item_link TEXT    NOT NULL,
-          sent_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-          PRIMARY KEY (user_id, item_link)
-      );`,
-      `CREATE INDEX IF NOT EXISTS idx_sent_rss_items_sent_at
-          ON sent_rss_items(sent_at);`,
-      // ---------------------------------------------------------------
-      // Флаг «фид уже инициализирован для пользователя».
-      // Отличает первый парсинг (сидируем без отправки, чтобы не залить
-      // пользователя историей) от последующих (отправляем только новое).
-      // ---------------------------------------------------------------
-      `CREATE TABLE IF NOT EXISTS feed_state (
-          user_id         INTEGER NOT NULL,
-          feed_url        TEXT    NOT NULL,
-          first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-          last_checked_at INTEGER,
-          PRIMARY KEY (user_id, feed_url)
-      );`
-    ];
-
-    let pending = queries.length;
-    let failed = false;
-
-    for (const sql of queries) {
-      dbLocal.run(sql, (err) => {
-        if (failed) return;
-        if (err) {
-          failed = true;
-          dbLocal.close();
-          return reject(err);
-        }
-        if (--pending === 0) {
-          dbLocal.close((closeErr) => {
-            if (closeErr) return reject(closeErr);
-            resolve();
-          });
-        }
-      });
-    }
-  });
-}
 
 // ---------- Bootstrap главного администратора ----------
 async function bootstrapAdmins() {
@@ -302,22 +179,15 @@ async function startBot() {
   try {
     botLogger.info('🚀 Запуск бота...');
 
-    await initDatabase();
-    botLogger.info('✅ База данных инициализирована (таблицы созданы)');
+    // Единая инициализация схемы через модуль db.js. Всё идёт через одно
+    // соединение — race condition между CREATE TABLE и запросами из других
+    // модулей (например, isRssItemSent) больше невозможен.
+    await db.initSchema();
+    botLogger.info('✅ Схема БД инициализирована (таблицы и индексы)');
 
-    // ---------------------------------------------------------------
     // Идемпотентная миграция: добавляет колонку user_feeds.feed_title,
-    // если её ещё нет. Вызывается через модуль db (у него своё соединение,
-    // независимое от initDatabase), поэтому не конфликтует с закрытием
-    // локального соединения.
-    //
-    // При первом запуске после деплоя: колонка добавляется, в лог идёт
-    // строка «🔄 Миграция: ...». При повторных запусках — тихо, ALTER
-    // вернёт ошибку 'duplicate column name', которую db.js глотает.
-    //
-    // Без этого вызова getYouTubeFeedsWithMeta / addUserFeed(3 арг) /
-    // updateUserFeedTitle упадут с 'no such column: feed_title'.
-    // ---------------------------------------------------------------
+    // если её ещё нет. Для свежих БД (initSchema создала колонку) —
+    // вернёт false и тихо пропустит. Для старых — выполнит ALTER.
     try {
       const titleAdded = await db.migrateUserFeedsAddTitle();
       if (titleAdded) {

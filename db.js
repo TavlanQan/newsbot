@@ -5,9 +5,6 @@ const config = require('./config');
 
 const db = new sqlite3.Database(config.DB_PATH);
 
-// Включаем WAL-режим
-db.run('PRAGMA journal_mode = WAL;');
-
 // ------------------- УТИЛИТЫ -------------------
 // Универсальная обёртка над db.run (для точечных запросов из других модулей)
 function run(sql, params = []) {
@@ -15,6 +12,163 @@ function run(sql, params = []) {
     db.run(sql, params, function (err) {
       if (err) reject(err);
       else resolve(this.changes);
+    });
+  });
+}
+
+// ------------------- ИНИЦИАЛИЗАЦИЯ СХЕМЫ -------------------
+// Создаёт все таблицы и индексы. Идемпотентно (CREATE IF NOT EXISTS).
+//
+// ВАЖНО: раньше эту работу делал bot.js::initDatabase() — но через СВОЁ
+// соединение (sqlite3.Database(DB_FILE)), независимое от модуля db.js.
+// Два соединения к одной SQLite не синхронизированы: запрос из db.js
+// (например, isRssItemSent) мог прилететь раньше, чем второе соединение
+// успевало создать sent_rss_items → 'no such table: main.sent_rss_items'.
+//
+// Теперь всё идёт через ЕДИНОЕ соединение модуля db.js. Плюс каждый шаг
+// выполняется последовательно (await), чтобы порядок CREATE TABLE → CREATE
+// INDEX гарантированно соблюдался.
+//
+// PRAGMA journal_mode = WAL тоже ждём — иначе первый же write мог бы
+// прилететь до переключения режима.
+async function initSchema() {
+  await run('PRAGMA journal_mode = WAL;');
+
+  const schema = [
+    `CREATE TABLE IF NOT EXISTS users (
+       user_id INTEGER PRIMARY KEY,
+       subscription_end INTEGER,
+       is_admin INTEGER DEFAULT 0,
+       created_at INTEGER DEFAULT (strftime('%s', 'now'))
+     )`,
+    `CREATE TABLE IF NOT EXISTS keywords (
+       user_id INTEGER,
+       keyword TEXT,
+       PRIMARY KEY (user_id, keyword)
+     )`,
+    `CREATE TABLE IF NOT EXISTS monitored_channels (
+       user_id INTEGER,
+       channel_id TEXT,
+       channel_username TEXT,
+       channel_title TEXT,
+       PRIMARY KEY (user_id, channel_id)
+     )`,
+    `CREATE TABLE IF NOT EXISTS target_channels (
+       user_id INTEGER,
+       channel_id TEXT,
+       channel_username TEXT,
+       channel_title TEXT,
+       PRIMARY KEY (user_id, channel_id)
+     )`,
+    // feed_title — человекочитаемое название фида (для YouTube-каналов —
+    // название канала). Может быть NULL. Для старых БД колонка добавляется
+    // отдельной идемпотентной миграцией migrateUserFeedsAddTitle().
+    `CREATE TABLE IF NOT EXISTS user_feeds (
+       user_id INTEGER,
+       feed_url TEXT,
+       feed_title TEXT,
+       PRIMARY KEY (user_id, feed_url)
+     )`,
+    `CREATE TABLE IF NOT EXISTS system_feeds (
+       feed_url TEXT PRIMARY KEY,
+       added_at INTEGER DEFAULT (strftime('%s','now'))
+     )`,
+    `CREATE TABLE IF NOT EXISTS forwarded_messages (
+       message_id INTEGER,
+       channel_id TEXT,
+       timestamp INTEGER DEFAULT (strftime('%s', 'now')),
+       PRIMARY KEY (message_id, channel_id)
+     )`,
+    `CREATE TABLE IF NOT EXISTS access_requests (
+       user_id      INTEGER PRIMARY KEY,
+       username     TEXT,
+       first_name   TEXT,
+       requested_at INTEGER DEFAULT (strftime('%s', 'now')),
+       status       TEXT DEFAULT 'pending'
+     )`,
+    // Персистентное состояние бота (forwarding_active и т.п.)
+    `CREATE TABLE IF NOT EXISTS settings (
+       key   TEXT PRIMARY KEY,
+       value TEXT
+     )`,
+    // Дедуп отправленных RSS-записей. Заменяет in-memory lastItemsCache:
+    // переживает рестарт, устраняет флуд и дубли между эквивалентными фидами.
+    `CREATE TABLE IF NOT EXISTS sent_rss_items (
+       user_id   INTEGER NOT NULL,
+       feed_url  TEXT    NOT NULL,
+       item_link TEXT    NOT NULL,
+       sent_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+       PRIMARY KEY (user_id, item_link)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_sent_rss_items_sent_at
+       ON sent_rss_items(sent_at)`,
+    // Флаг «фид уже инициализирован для пользователя». Отличает первый
+    // парсинг (сидируем без отправки) от последующих (шлём только новое).
+    `CREATE TABLE IF NOT EXISTS feed_state (
+       user_id         INTEGER NOT NULL,
+       feed_url        TEXT    NOT NULL,
+       first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+       last_checked_at INTEGER,
+       PRIMARY KEY (user_id, feed_url)
+     )`
+  ];
+
+  for (const sql of schema) {
+    await run(sql);
+  }
+}
+
+// ------------------- НАСТРОЙКИ (settings) -------------------
+// Обёртки над таблицей key-value. Заменяют персональные соединения,
+// которые bot.js открывал для load/save forwarding_active.
+function getSetting(key) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT value FROM settings WHERE key = ?', [key], (err, row) => {
+      if (err) reject(err);
+      else resolve(row ? row.value : null);
+    });
+  });
+}
+
+function setSetting(key, value) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [key, value],
+      function (err) {
+        if (err) reject(err);
+        else resolve(true);
+      }
+    );
+  });
+}
+
+// ------------------- ТРАНЗАКЦИИ -------------------
+// Оборачивает fn() в BEGIN/COMMIT, при ошибке — ROLLBACK.
+// fn должна возвращать Promise. Возвращает результат fn.
+//
+// Пока не используется, но понадобится для Задачи 4 (мягкая миграция
+// легаси-фидов: removeUserFeed + removeFeedState + addUserFeed + initFeedState
+// должны быть атомарны).
+//
+// ВНИМАНИЕ: SQLite не поддерживает вложенные транзакции. Не вызывать
+// withTransaction внутри withTransaction.
+function withTransaction(fn) {
+  return new Promise((resolve, reject) => {
+    db.run('BEGIN', (err) => {
+      if (err) return reject(err);
+      Promise.resolve()
+        .then(() => fn())
+        .then((result) => {
+          db.run('COMMIT', (err) => {
+            if (err) return reject(err);
+            resolve(result);
+          });
+        })
+        .catch((err) => {
+          db.run('ROLLBACK', () => reject(err));
+        });
     });
   });
 }
@@ -120,21 +274,6 @@ function listAdmins() {
 }
 
 // ------------------- ЗАПРОСЫ НА ДОСТУП -------------------
-function ensureAccessRequestsTable() {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `CREATE TABLE IF NOT EXISTS access_requests (
-        user_id      INTEGER PRIMARY KEY,
-        username     TEXT,
-        first_name   TEXT,
-        requested_at INTEGER DEFAULT (strftime('%s','now')),
-        status       TEXT DEFAULT 'pending'
-      )`,
-      (err) => (err ? reject(err) : resolve())
-    );
-  });
-}
-
 function addAccessRequest(userId, username, firstName) {
   return new Promise((resolve, reject) => {
     const sql = `
@@ -335,13 +474,12 @@ function updateUserFeedTitle(userId, feedUrl, feedTitle) {
 }
 
 // Идемпотентная миграция: добавляет колонку feed_title в user_feeds,
-// если её ещё нет. SQLite не поддерживает ADD COLUMN IF NOT EXISTS,
-// поэтому глотаем только ошибку 'duplicate column name' (норма при
-// повторных запусках бота). Любую другую ошибку пробрасываем — это
-// может быть реальная проблема со схемой.
+// если её ещё нет. Нужна для БД, созданных ДО того, как feed_title была
+// добавлена в initSchema(). SQLite не поддерживает ADD COLUMN IF NOT
+// EXISTS, поэтому глотаем только ошибку 'duplicate column name'.
 //
-// Возвращает true, если колонка была добавлена (первый запуск),
-// false — если уже существовала.
+// Возвращает true, если колонка была добавлена (старая БД),
+// false — если уже существовала (свежая БД или повторный запуск).
 function migrateUserFeedsAddTitle() {
   return new Promise((resolve, reject) => {
     db.run('ALTER TABLE user_feeds ADD COLUMN feed_title TEXT', (err) => {
@@ -370,18 +508,6 @@ function getAllFeeds() {
 // Глобальные RSS-ленты, доступные только главному администратору.
 // Парсятся для всех активных пользователей в newsService (с фильтром по ключевым словам).
 // Изначально мигрируются из .env (RSS_FEEDS) при первом запуске, потом управляются через бота.
-function ensureSystemFeedsTable() {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `CREATE TABLE IF NOT EXISTS system_feeds (
-        feed_url TEXT PRIMARY KEY,
-        added_at INTEGER DEFAULT (strftime('%s','now'))
-      )`,
-      (err) => (err ? reject(err) : resolve())
-    );
-  });
-}
-
 function getSystemFeeds() {
   return new Promise((resolve, reject) => {
     db.all('SELECT feed_url FROM system_feeds ORDER BY added_at ASC', (err, rows) => {
@@ -410,32 +536,6 @@ function removeSystemFeed(feedUrl) {
 }
 
 // ------------------- ОТПРАВЛЕННЫЕ RSS-ЗАПИСИ (sent_rss_items) -------------------
-// Замена in-memory lastItemsCache из newsService. Ключ — пара (user_id, item_link),
-// поэтому одна и та же ссылка не будет отправлена пользователю дважды, даже если
-// она пришла из нескольких эквивалентных фидов (например, двух YouTube-хендлов
-// одного и того же канала).
-function ensureSentRssItemsTable() {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `CREATE TABLE IF NOT EXISTS sent_rss_items (
-        user_id   INTEGER NOT NULL,
-        feed_url  TEXT    NOT NULL,
-        item_link TEXT    NOT NULL,
-        sent_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-        PRIMARY KEY (user_id, item_link)
-      )`,
-      (err) => {
-        if (err) return reject(err);
-        db.run(
-          `CREATE INDEX IF NOT EXISTS idx_sent_rss_items_sent_at
-           ON sent_rss_items(sent_at)`,
-          (idxErr) => (idxErr ? reject(idxErr) : resolve())
-        );
-      }
-    );
-  });
-}
-
 function isRssItemSent(userId, itemLink) {
   return new Promise((resolve, reject) => {
     db.get(
@@ -511,25 +611,6 @@ function cleanOldSentItems(days = 30) {
 }
 
 // ------------------- СОСТОЯНИЕ ФИДА (feed_state) -------------------
-// Отличает «первый парсинг фида у пользователя» (сидируем без отправки)
-// от последующих (отправляем только новое). Без этой таблицы либо зальём
-// пользователя всей историей при добавлении фида, либо потеряем записи,
-// появившиеся во время простоя.
-function ensureFeedStateTable() {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `CREATE TABLE IF NOT EXISTS feed_state (
-        user_id         INTEGER NOT NULL,
-        feed_url        TEXT    NOT NULL,
-        first_seen_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-        last_checked_at INTEGER,
-        PRIMARY KEY (user_id, feed_url)
-      )`,
-      (err) => (err ? reject(err) : resolve())
-    );
-  });
-}
-
 function hasFeedState(userId, feedUrl) {
   return new Promise((resolve, reject) => {
     db.get(
@@ -616,8 +697,14 @@ function cleanOldForwarded(days = 30) {
 }
 
 module.exports = {
-  // утилиты
+  // утилиты + схема
   run,
+  initSchema,
+  // настройки
+  getSetting,
+  setSetting,
+  // транзакции
+  withTransaction,
   // пользователи
   getUser,
   addUser,
@@ -629,7 +716,6 @@ module.exports = {
   setAdmin,
   listAdmins,
   // запросы на доступ
-  ensureAccessRequestsTable,
   addAccessRequest,
   getAccessRequest,
   getPendingAccessRequests,
@@ -655,18 +741,15 @@ module.exports = {
   migrateUserFeedsAddTitle,
   getAllFeeds,
   // системные ленты
-  ensureSystemFeedsTable,
   getSystemFeeds,
   addSystemFeed,
   removeSystemFeed,
   // отправленные RSS-записи (дедуп)
-  ensureSentRssItemsTable,
   isRssItemSent,
   markRssItemSent,
   markRssItemsSentBulk,
   cleanOldSentItems,
   // состояние фида (сидирование)
-  ensureFeedStateTable,
   hasFeedState,
   initFeedState,
   touchFeedState,
