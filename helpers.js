@@ -378,7 +378,15 @@ function extractChannelTitleFromRssXml(xml) {
   const match = xml.match(/<title>([\s\S]*?)<\/title>/i);
   if (!match) return null;
 
-  let title = unescapeXmlBasic(match[1]).trim();
+  // FIX: rss-пакет оборачивает title в <![CDATA[...]]>. Регексп выше
+  // захватывает содержимое тега целиком, включая обёртку. unescapeXmlBasic
+  // её не снимает (CDATA — не entity), поэтому в БД уезжала строка
+  // "<![CDATA[Название]]>" вместо чистого названия. Снимаем CDATA явно.
+  let raw = match[1].trim();
+  const cdataMatch = raw.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
+  if (cdataMatch) raw = cdataMatch[1];
+
+  let title = unescapeXmlBasic(raw).trim();
   if (!title) return null;
 
   // Отсекаем случай, когда вместо названия подставлен fallback-UC ID

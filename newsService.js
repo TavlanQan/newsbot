@@ -200,7 +200,7 @@ async function checkFeedForUser(userId, feedUrl, bot, keywords, targets) {
     await db.touchFeedState(userId, feedUrl);
 
     if (newCount > 0) {
-      rssLogger.debug(
+      rssLogger.info(
         `📥 ${feedUrl} (user=${userId}): новых=${newCount}, совпало с keywords=${matchedCount}`
       );
     }
